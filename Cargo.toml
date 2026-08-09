@@ -1,0 +1,17 @@
+[package]
+name = "model-painter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wgpu = "30"
+winit = "0.30"
+pollster = "0.4"
+glam = "0.33.2"
+bytemuck = { version = "1", features = ["derive"] }
+arboard = "3"
+env_logger = "0.11"
+log = "0.4"
+mega-ui = { path = "../../../rust_lib/mega/ui", features = ["wgpu"] }
+mega-render = { path = "../../../rust_lib/mega/render" }
+rfd = "0.15"
