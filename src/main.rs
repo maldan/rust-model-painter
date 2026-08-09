@@ -3,6 +3,7 @@ mod bvh;
 mod gpu_paint;
 mod paint;
 mod pick;
+mod post_ui;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,7 +14,7 @@ use gpu_paint::{cursor_to_map_px, write_paint_rgba, GpuPaint};
 use mega_render::{Visualizer, WgpuVisualizer};
 use mega_ui::wgpu::UiRenderer;
 use mega_ui::{CursorIcon, Ui, UiInput};
-use paint::TEX_SIZE;
+use paint::{PaintMap, TEX_SIZE};
 use pick::find_viewport_rect;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -295,7 +296,7 @@ impl Host {
             self.painter.viewport_size.y.max(1.0) as u32,
         );
         visualizer.ensure_target(vp.0, vp.1);
-        visualizer.post_process().tonemap.exposure = 1.1;
+        *visualizer.post_process() = self.painter.post.clone();
 
         let mut ui_renderer = UiRenderer::new(&device, &queue, format, &self.ui);
         ui_renderer.set_viewport(&queue, width as f32, height as f32);
@@ -437,9 +438,14 @@ impl Host {
             }
         }
 
-        self.painter.sync_paint_if_dirty();
-        self.animating =
-            keep_ui || self.looking || self.panning || self.painter.painting || out.needs_repaint;
+        let needs_composite = self.painter.docs.iter().any(|d| d.composite_dirty)
+            || self.painter.needs_map_seed;
+        self.animating = keep_ui
+            || self.looking
+            || self.panning
+            || self.painter.painting
+            || out.needs_repaint
+            || needs_composite;
 
         // Brush cursor (scene HUD on viewport texture).
         let vp_rect = self.last_viewport_rect.unwrap_or(mega_ui::Rect {
@@ -472,46 +478,44 @@ impl Host {
             gpu.scene_target
                 .resize(&gpu.device, &mut gpu.ui_renderer, vp_w, vp_h);
             gpu.visualizer.ensure_target(vp_w, vp_h);
+            *gpu.visualizer.post_process() = self.painter.post.clone();
 
             gpu.visualizer.sync(&self.painter.scene);
             gpu.visualizer.set_debug_view(self.painter.debug_view);
 
-            // Layer/CPU recompose → push into gpu-resident paint maps.
-            if self.painter.needs_gpu_albedo_upload {
-                let paint_tex = gpu
-                    .visualizer
-                    .texture_gpu(self.painter.albedo_tex)
-                    .cloned();
-                if let Some(paint_tex) = paint_tex {
-                    if let Some(cpu) = self.painter.scene.textures.get(self.painter.albedo_tex) {
-                        write_paint_rgba(
-                            &gpu.queue,
-                            &paint_tex,
-                            &cpu.rgba,
-                            cpu.width,
-                            cpu.height,
-                        );
+            // gpu_resident maps keep GPU as source of truth — force a clean base upload
+            // after create/load so the first frame isn't uninitialized garbage.
+            if self.painter.needs_map_seed {
+                let albedo = gpu.visualizer.texture_gpu(self.painter.albedo_tex).cloned();
+                let mr = gpu.visualizer.texture_gpu(self.painter.mr_tex).cloned();
+                if let (Some(albedo), Some(mr)) = (albedo, mr) {
+                    self.painter.seed_map_pixels(&gpu.queue, &albedo, &mr);
+                    self.painter.needs_map_seed = false;
+                    for doc in &mut self.painter.docs {
+                        doc.mark_dirty();
                     }
                 }
-                self.painter.needs_gpu_albedo_upload = false;
             }
-            if self.painter.needs_gpu_mr_upload {
-                let paint_tex = gpu.visualizer.texture_gpu(self.painter.mr_tex).cloned();
-                if let Some(paint_tex) = paint_tex {
-                    if let Some(cpu) = self.painter.scene.textures.get(self.painter.mr_tex) {
-                        write_paint_rgba(
-                            &gpu.queue,
-                            &paint_tex,
-                            &cpu.rgba,
-                            cpu.width,
-                            cpu.height,
-                        );
+
+            // Clear layers flagged by UI (after sync so GPU tex exists).
+            for doc in &mut self.painter.docs {
+                for layer in &mut doc.layers {
+                    if !layer.needs_clear {
+                        continue;
                     }
+                    let Some(tex) = gpu.visualizer.texture_gpu(layer.tex).cloned() else {
+                        // Keep needs_clear until the GPU tex is actually created.
+                        doc.composite_dirty = true;
+                        continue;
+                    };
+                    gpu.gpu_paint.clear_texture(&gpu.queue, &tex, (TEX_SIZE, TEX_SIZE));
+                    layer.needs_clear = false;
+                    doc.composite_dirty = true;
                 }
-                self.painter.needs_gpu_mr_upload = false;
             }
 
             let stamps = self.painter.take_pending_stamps();
+            let mut did_stamp = false;
             if !stamps.is_empty() {
                 let aspect = vp_w as f32 / vp_h as f32;
                 gpu.gpu_paint.ensure_uv_targets(&gpu.device, vp_w, vp_h);
@@ -530,27 +534,121 @@ impl Host {
                     aspect,
                 );
 
-                let target = self.painter.paint_tex();
-                let paint_tex = gpu.visualizer.texture_gpu(target).cloned();
-                let stamp_brush = self.painter.stamp_brush();
-                let channel_mask = self.painter.paint_map.channel_mask();
-                if let Some(paint_tex) = paint_tex {
-                    for stamp in &stamps {
-                        let center = cursor_to_map_px(stamp.screen, stamp.viewport, vp_w, vp_h);
-                        let screen_r = (stamp.screen_radius_px * 2.0).max(4.0);
-                        gpu.gpu_paint.stamp(
-                            &gpu.device,
-                            &gpu.queue,
-                            &mut encoder,
-                            &paint_tex,
-                            (TEX_SIZE, TEX_SIZE),
-                            &stamp_brush,
-                            channel_mask,
-                            center,
-                            screen_r,
-                            stamp_brush.radius,
-                        );
+                // Stamp into the active layer — never into the material composite.
+                if let Some(layer_h) = self.painter.active_layer_tex() {
+                    let paint_tex = gpu.visualizer.texture_gpu(layer_h).cloned();
+                    let stamp_brush = self.painter.stamp_brush();
+                    if let Some(paint_tex) = paint_tex {
+                        for stamp in &stamps {
+                            let center = cursor_to_map_px(stamp.screen, stamp.viewport, vp_w, vp_h);
+                            let screen_r = (stamp.screen_radius_px * 2.0).max(4.0);
+                            gpu.gpu_paint.stamp(
+                                &gpu.device,
+                                &gpu.queue,
+                                &mut encoder,
+                                &paint_tex,
+                                (TEX_SIZE, TEX_SIZE),
+                                &stamp_brush,
+                                [1.0, 1.0, 1.0, 1.0],
+                                center,
+                                screen_r,
+                                stamp_brush.radius,
+                            );
+                        }
+                        did_stamp = true;
                     }
+                }
+                gpu.queue.submit(Some(encoder.finish()));
+                if did_stamp {
+                    self.painter.doc_mut().mark_dirty();
+                }
+            }
+
+            // If either MR stack is dirty, rebuild both channels from a clean seed.
+            if self.painter.docs[PaintMap::Metallic.index()].composite_dirty
+                || self.painter.docs[PaintMap::Roughness.index()].composite_dirty
+            {
+                self.painter.docs[PaintMap::Metallic.index()].mark_dirty();
+                self.painter.docs[PaintMap::Roughness.index()].mark_dirty();
+                if let Some(mr) = gpu.visualizer.texture_gpu(self.painter.mr_tex).cloned() {
+                    if let Some(cpu) = self.painter.scene.textures.get(self.painter.mr_tex) {
+                        write_paint_rgba(&gpu.queue, &mr, &cpu.rgba, cpu.width, cpu.height);
+                    }
+                }
+            }
+
+            // Recomposite dirty paint maps into material textures.
+            // One submit per map: `composite_stack` writes a shared UBO via
+            // `queue.write_buffer`, which is not ordered inside the encoder — packing
+            // Metallic then Roughness into one encoder made Metallic run with the
+            // Roughness channel mask (paint landed in G, not B).
+            let dirty_maps: Vec<_> = PaintMap::ALL
+                .iter()
+                .copied()
+                .filter(|&m| self.painter.docs[m.index()].composite_dirty)
+                .collect();
+            for map in dirty_maps {
+                let _ = self.painter.docs[map.index()].take_composite_dirty();
+                let dst_h = match map {
+                    PaintMap::Albedo => self.painter.albedo_tex,
+                    PaintMap::Metallic | PaintMap::Roughness => self.painter.mr_tex,
+                };
+                let Some(dst) = gpu.visualizer.texture_gpu(dst_h).cloned() else {
+                    self.painter.docs[map.index()].mark_dirty();
+                    continue;
+                };
+
+                // Collect layer GPU textures (bottom → top). Missing / uncleared → base-only, retry later.
+                let layer_handles: Vec<_> = self.painter.docs[map.index()]
+                    .layers
+                    .iter()
+                    .filter(|l| l.visible && l.opacity > 0.001)
+                    .map(|l| (l.tex, l.opacity, l.needs_clear))
+                    .collect();
+                let mut layer_texs = Vec::with_capacity(layer_handles.len());
+                let mut layers_ready = true;
+                for &(h, opacity, needs_clear) in &layer_handles {
+                    if needs_clear {
+                        layers_ready = false;
+                        break;
+                    }
+                    let Some(t) = gpu.visualizer.texture_gpu(h).cloned() else {
+                        layers_ready = false;
+                        break;
+                    };
+                    layer_texs.push((t, opacity));
+                }
+
+                let mut encoder = gpu.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor {
+                        label: Some("gpu_paint_composite_stack"),
+                    },
+                );
+                if !layers_ready {
+                    // Still wipe dst to base so the mesh isn't garbage this frame.
+                    gpu.gpu_paint.composite_stack(
+                        &gpu.device,
+                        &gpu.queue,
+                        &mut encoder,
+                        &dst,
+                        (TEX_SIZE, TEX_SIZE),
+                        self.painter.docs[map.index()].base_rgba,
+                        map.channel_mask(),
+                        &[],
+                    );
+                    self.painter.docs[map.index()].mark_dirty();
+                } else {
+                    let layer_refs: Vec<_> = layer_texs.iter().map(|(t, o)| (t, *o)).collect();
+                    gpu.gpu_paint.composite_stack(
+                        &gpu.device,
+                        &gpu.queue,
+                        &mut encoder,
+                        &dst,
+                        (TEX_SIZE, TEX_SIZE),
+                        self.painter.docs[map.index()].base_rgba,
+                        map.channel_mask(),
+                        &layer_refs,
+                    );
                 }
                 gpu.queue.submit(Some(encoder.finish()));
             }

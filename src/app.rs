@@ -6,12 +6,13 @@ use std::time::Instant;
 use glam::{Mat4, Vec2, Vec3};
 use mega_render::{
     cube, load_gltf, plane, sphere, Camera, DebugView, Handle, InputFrame, Light, Material, Mesh,
-    Node, Scene, Texture, Transform,
+    Node, PostProcessSettings, Scene, Texture, Transform,
 };
 use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
 
 use crate::paint::{Brush, PaintDocument, PaintMap, TEX_SIZE};
 use crate::pick::{self, BvhCache};
+use crate::post_ui;
 use mega_ui::Rect;
 
 pub const SCENE_TEX: u32 = 0;
@@ -51,10 +52,6 @@ pub struct Painter {
     pub shape: usize,
     pub model_name: String,
     pub status: String,
-    /// Layer stack changed — re-upload composite into gpu-resident albedo.
-    pub needs_gpu_albedo_upload: bool,
-    /// Layer stack changed — re-upload MR channels into gpu-resident map.
-    pub needs_gpu_mr_upload: bool,
     pending_stamps: Vec<PendingStamp>,
     last_stamp_px: Option<Vec2>,
     root: Handle<Node>,
@@ -63,8 +60,10 @@ pub struct Painter {
     cube_node: Handle<Node>,
     model_root: Option<Handle<Node>>,
     bvh_cache: BvhCache,
-    /// Scratch for MR channel composite from a grayscale layer stack.
-    mr_scratch: Vec<u8>,
+    /// After create/load: push CPU base pixels into GPU material maps once.
+    pub needs_map_seed: bool,
+    /// Post stack — synced to the visualizer each frame.
+    pub post: PostProcessSettings,
 }
 
 impl Painter {
@@ -77,19 +76,20 @@ impl Painter {
         }
         scene.ambient = [0.08, 0.08, 0.09];
 
-        let rough_u8 = (0.45 * 255.0) as u8;
-        let docs = [
-            PaintDocument::new(TEX_SIZE, TEX_SIZE),
-            PaintDocument::with_base(TEX_SIZE, TEX_SIZE, [0, 0, 0]),
-            PaintDocument::with_base(TEX_SIZE, TEX_SIZE, [rough_u8, rough_u8, rough_u8]),
+        let rough = 0.45;
+        let mut docs = [
+            PaintDocument::new(TEX_SIZE, TEX_SIZE, [220.0 / 255.0, 220.0 / 255.0, 225.0 / 255.0, 1.0]),
+            PaintDocument::new(TEX_SIZE, TEX_SIZE, [0.0, 0.0, 0.0, 1.0]),
+            PaintDocument::new(TEX_SIZE, TEX_SIZE, [0.0, rough, 0.0, 1.0]),
         ];
 
+        // Material composite targets (filled by GPU layer composite).
         let mut albedo = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, true);
-        docs[0].composite_into(&mut albedo.rgba);
+        fill_rgba(&mut albedo.rgba, 220, 220, 225, 255);
         let albedo_tex = scene.textures.insert(albedo);
 
-        // glTF ORM: R unused, G=roughness, B=metallic. Scalars on material = 1 so map wins.
         let mut mr = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false);
+        let rough_u8 = (rough * 255.0) as u8;
         for px in mr.rgba.chunks_exact_mut(4) {
             px[0] = 255;
             px[1] = rough_u8;
@@ -97,6 +97,16 @@ impl Painter {
             px[3] = 255;
         }
         let mr_tex = scene.textures.insert(mr);
+
+        // Seed each stack with one empty GPU layer.
+        for doc in &mut docs {
+            let tex = scene
+                .textures
+                .insert(Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false));
+            doc.layers.push(crate::paint::Layer::new("Layer 1", tex));
+            doc.active = 0;
+            doc.mark_dirty();
+        }
 
         let mut paint_mat_data = Material::new([1.0, 1.0, 1.0, 1.0], 1.0, 1.0).with_map(albedo_tex);
         paint_mat_data.metallic_roughness_map = Some(mr_tex);
@@ -163,7 +173,7 @@ impl Painter {
                 DockNode::leaf(&["Viewport"]),
                 DockNode::split_v(
                     0.55,
-                    DockNode::leaf(&["Brush", "Lights"]),
+                    DockNode::leaf(&["Brush", "Lights", "Effects"]),
                     DockNode::leaf(&["Layers"]),
                 ),
             )),
@@ -176,8 +186,6 @@ impl Painter {
             shape: 0,
             model_name: String::new(),
             status: "Ready · GPU brush".into(),
-            needs_gpu_albedo_upload: false,
-            needs_gpu_mr_upload: false,
             pending_stamps: Vec::new(),
             last_stamp_px: None,
             root,
@@ -186,7 +194,12 @@ impl Painter {
             cube_node,
             model_root: None,
             bvh_cache: HashMap::new(),
-            mr_scratch: vec![0; (TEX_SIZE * TEX_SIZE * 4) as usize],
+            needs_map_seed: true,
+            post: {
+                let mut post = PostProcessSettings::default();
+                post.tonemap.exposure = 1.1;
+                post
+            },
         };
         painter.rebuild_bvhs();
         painter.apply_camera();
@@ -201,11 +214,9 @@ impl Painter {
         &mut self.docs[self.paint_map.index()]
     }
 
-    pub fn paint_tex(&self) -> Handle<Texture> {
-        match self.paint_map {
-            PaintMap::Albedo => self.albedo_tex,
-            PaintMap::Metallic | PaintMap::Roughness => self.mr_tex,
-        }
+    pub fn active_layer_tex(&self) -> Option<Handle<Texture>> {
+        let doc = self.doc();
+        doc.layers.get(doc.active).map(|l| l.tex)
     }
 
     /// Grayscale brush color for metallic / roughness stamps.
@@ -221,6 +232,53 @@ impl Painter {
                 }
             }
         }
+    }
+
+    fn alloc_layer_tex(&mut self) -> Handle<Texture> {
+        self.scene
+            .textures
+            .insert(Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false))
+    }
+
+    pub fn add_layer(&mut self) {
+        let name = {
+            let n = self.doc().layers.len() + 1;
+            format!("Layer {n}")
+        };
+        let tex = self.alloc_layer_tex();
+        let doc = self.doc_mut();
+        doc.layers.push(crate::paint::Layer::new(name, tex));
+        doc.active = doc.layers.len() - 1;
+        doc.mark_dirty();
+    }
+
+    pub fn remove_active_layer(&mut self) {
+        let active = self.doc().active;
+        if self.doc().layers.len() <= 1 {
+            let doc = self.doc_mut();
+            if let Some(l) = doc.layers.get_mut(0) {
+                l.needs_clear = true;
+            }
+            doc.mark_dirty();
+            return;
+        }
+        let tex = {
+            let doc = self.doc_mut();
+            let layer = doc.layers.remove(active);
+            doc.active = active.min(doc.layers.len() - 1);
+            doc.mark_dirty();
+            layer.tex
+        };
+        self.scene.textures.remove(tex);
+    }
+
+    pub fn clear_active_layer(&mut self) {
+        let active = self.doc().active;
+        let doc = self.doc_mut();
+        if let Some(l) = doc.layers.get_mut(active) {
+            l.needs_clear = true;
+        }
+        doc.mark_dirty();
     }
 
     pub fn apply_camera(&mut self) {
@@ -311,7 +369,6 @@ impl Painter {
         let root = load_gltf(&mut self.scene, path, Some(self.root))?;
         self.model_root = Some(root);
 
-        // Wire paint maps onto every mesh material.
         let mesh_nodes = collect_mesh_nodes(&self.scene, Some(root));
         let mut touched = std::collections::HashSet::new();
         for &h in &mesh_nodes {
@@ -346,25 +403,61 @@ impl Painter {
     }
 
     fn reset_paint_docs(&mut self) {
-        let rough_u8 = (0.45 * 255.0) as u8;
-        self.docs = [
-            PaintDocument::new(TEX_SIZE, TEX_SIZE),
-            PaintDocument::with_base(TEX_SIZE, TEX_SIZE, [0, 0, 0]),
-            PaintDocument::with_base(TEX_SIZE, TEX_SIZE, [rough_u8, rough_u8, rough_u8]),
-        ];
-        for d in &mut self.docs {
-            d.mark_dirty();
+        let mut old = Vec::new();
+        for doc in &mut self.docs {
+            for layer in doc.layers.drain(..) {
+                old.push(layer.tex);
+            }
         }
-        self.needs_gpu_albedo_upload = true;
-        self.needs_gpu_mr_upload = true;
+        for tex in old {
+            self.scene.textures.remove(tex);
+        }
 
-        if let Some(mr) = self.scene.textures.get_mut(self.mr_tex) {
-            for px in mr.rgba.chunks_exact_mut(4) {
+        let rough = 0.45;
+        let rough_u8 = (rough * 255.0) as u8;
+        self.docs = [
+            PaintDocument::new(
+                TEX_SIZE,
+                TEX_SIZE,
+                [220.0 / 255.0, 220.0 / 255.0, 225.0 / 255.0, 1.0],
+            ),
+            PaintDocument::new(TEX_SIZE, TEX_SIZE, [0.0, 0.0, 0.0, 1.0]),
+            PaintDocument::new(TEX_SIZE, TEX_SIZE, [0.0, rough, 0.0, 1.0]),
+        ];
+        for i in 0..3 {
+            let tex = self
+                .scene
+                .textures
+                .insert(Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false));
+            self.docs[i]
+                .layers
+                .push(crate::paint::Layer::new("Layer 1", tex));
+            self.docs[i].active = 0;
+            self.docs[i].mark_dirty();
+        }
+
+        // Reset CPU mirrors (gpu_resident won't re-upload on version bump alone).
+        if let Some(tex) = self.scene.textures.get_mut(self.albedo_tex) {
+            fill_rgba(&mut tex.rgba, 220, 220, 225, 255);
+        }
+        if let Some(tex) = self.scene.textures.get_mut(self.mr_tex) {
+            for px in tex.rgba.chunks_exact_mut(4) {
                 px[0] = 255;
                 px[1] = rough_u8;
                 px[2] = 0;
                 px[3] = 255;
             }
+        }
+        self.needs_map_seed = true;
+    }
+
+    /// Upload albedo/MR CPU bases into GPU (call after visualizer.sync).
+    pub fn seed_map_pixels(&self, queue: &wgpu::Queue, albedo: &wgpu::Texture, mr: &wgpu::Texture) {
+        if let Some(cpu) = self.scene.textures.get(self.albedo_tex) {
+            crate::gpu_paint::write_paint_rgba(queue, albedo, &cpu.rgba, cpu.width, cpu.height);
+        }
+        if let Some(cpu) = self.scene.textures.get(self.mr_tex) {
+            crate::gpu_paint::write_paint_rgba(queue, mr, &cpu.rgba, cpu.width, cpu.height);
         }
     }
 
@@ -381,43 +474,6 @@ impl Painter {
         self.orbit_dist = (radius * 2.4).clamp(1.2, 60.0);
         self.orbit_pitch = 0.35;
         self.apply_camera();
-    }
-
-    pub fn sync_paint_if_dirty(&mut self) {
-        // Albedo stack
-        if let Some(rect) = self.docs[0].take_dirty_rect() {
-            if let Some(tex) = self.scene.textures.get_mut(self.albedo_tex) {
-                self.docs[0].composite_rect(&mut tex.rgba, rect);
-                self.needs_gpu_albedo_upload = true;
-            }
-        }
-
-        // Metallic / roughness → MR channels (B / G)
-        for map in [PaintMap::Metallic, PaintMap::Roughness] {
-            let Some(channel) = map.mr_channel() else {
-                continue;
-            };
-            let idx = map.index();
-            let Some(rect) = self.docs[idx].take_dirty_rect() else {
-                continue;
-            };
-            self.docs[idx].composite_rect(&mut self.mr_scratch, rect);
-            let Some(tex) = self.scene.textures.get_mut(self.mr_tex) else {
-                continue;
-            };
-            let w = TEX_SIZE;
-            let x0 = rect.x0.min(w.saturating_sub(1));
-            let y0 = rect.y0.min(w.saturating_sub(1));
-            let x1 = rect.x1.min(w.saturating_sub(1));
-            let y1 = rect.y1.min(w.saturating_sub(1));
-            for y in y0..=y1 {
-                for x in x0..=x1 {
-                    let i = ((y * w + x) * 4) as usize;
-                    tex.rgba[i + channel] = self.mr_scratch[i];
-                }
-            }
-            self.needs_gpu_mr_upload = true;
-        }
     }
 
     pub fn take_pending_stamps(&mut self) -> Vec<PendingStamp> {
@@ -441,6 +497,7 @@ impl Painter {
             viewport,
             screen_radius_px: radius_px,
         });
+        self.doc_mut().mark_dirty();
     }
 
     /// Face-on screen size of `brush.radius` at the surface under `screen` (or orbit fallback).
@@ -601,6 +658,7 @@ impl Painter {
             let viewport_size = &mut self.viewport_size;
             let brush = &mut self.brush;
             let docs = &mut self.docs;
+            let post = &mut self.post;
             let model_name = self.model_name.as_str();
             let scene = &mut self.scene;
 
@@ -703,6 +761,11 @@ impl Painter {
                         {
                             keep = true;
                         }
+                    }
+                }
+                "Effects" => {
+                    if post_ui::post_effects_panel(ui, post, scene) {
+                        keep = true;
                     }
                 }
                 "Layers" => {
@@ -817,13 +880,13 @@ impl Painter {
             self.doc_mut().mark_dirty();
         }
         if add_layer {
-            self.doc_mut().add_layer();
+            self.add_layer();
         }
         if del_layer {
-            self.doc_mut().remove_active();
+            self.remove_active_layer();
         }
         if clear_layer {
-            self.doc_mut().clear_active();
+            self.clear_active_layer();
         }
         if move_up {
             self.doc_mut().move_active(1);
@@ -833,6 +896,15 @@ impl Painter {
         }
 
         keep || self.painting
+    }
+}
+
+fn fill_rgba(buf: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
+    for px in buf.chunks_exact_mut(4) {
+        px[0] = r;
+        px[1] = g;
+        px[2] = b;
+        px[3] = a;
     }
 }
 

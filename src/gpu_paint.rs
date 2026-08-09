@@ -1,9 +1,8 @@
 //! GPU texture painting: UV-as-color + world-space brush (Substance-style).
 //!
 //! 1) Offscreen pass writes UV+facing and world position (depth-tested).
-//! 2) Compute splat: screen window search, but coverage from **world distance**
-//!    and **facing** — round strokes in 3D, no back-face bleed.
-//! 3) Light 1-texel dilate on stroke, then blend onto gpu-resident albedo.
+//! 2) Compute splat onto the **active layer** texture.
+//! 3) Layer stack composite → material maps (albedo / MR channels).
 
 use std::collections::HashMap;
 
@@ -14,6 +13,9 @@ use mega_ui::Rect;
 use wgpu::util::DeviceExt;
 
 use crate::paint::Brush;
+
+/// Uniform slot stride for dynamic-offset stack passes (WebGPU min alignment).
+const STACK_UBO_STRIDE: u64 = 256;
 
 const UV_CLEAR: wgpu::Color = wgpu::Color {
     r: 0.0,
@@ -58,7 +60,7 @@ struct BrushUniforms {
     /// WGSL uniform `vec4` aligns to 16 — pad 8 bytes after the f32 pair above.
     _pad_to_color: [f32; 2],
     color: [f32; 4],
-    /// Per-channel write mask (albedo 1,1,1; roughness 0,1,0; metallic 0,0,1).
+    /// Per-channel write mask (always 1s when stamping into a layer).
     channel_mask: [f32; 4],
     opacity: f32,
     _pad1: f32,
@@ -68,6 +70,18 @@ struct BrushUniforms {
     tex_h: u32,
     /// Struct size rounded to 16 in WGSL uniform address space.
     _pad_end: [u32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct StackUniforms {
+    base: [f32; 4],
+    channel_mask: [f32; 4],
+    opacity: f32,
+    /// 0 = apply base (masked), 1 = blend layer over dst.
+    mode: u32,
+    tex_w: u32,
+    tex_h: u32,
 }
 
 struct PaintMesh {
@@ -107,6 +121,12 @@ pub struct GpuPaint {
     comp_bind_layout: wgpu::BindGroupLayout,
     brush_buf: wgpu::Buffer,
 
+    stack_pipeline: wgpu::ComputePipeline,
+    stack_bind_layout: wgpu::BindGroupLayout,
+    /// Packed stack uniforms (256-byte stride) — written once per composite.
+    stack_buf: wgpu::Buffer,
+    stack_buf_slots: u32,
+
     meshes: HashMap<(u32, u32), PaintMesh>,
 }
 
@@ -142,10 +162,7 @@ impl GpuPaint {
             }],
         });
 
-        let uv_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gpu_paint_uv"),
-            source: wgpu::ShaderSource::Wgsl(UV_WGSL.into()),
-        });
+        let uv_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/uv_map.wgsl"));
         let uv_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("gpu_paint_uv_pipeline"),
             layout: Some(
@@ -228,10 +245,7 @@ impl GpuPaint {
                 storage_entry(3),
             ],
         });
-        let splat_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gpu_paint_splat"),
-            source: wgpu::ShaderSource::Wgsl(SPLAT_WGSL.into()),
-        });
+        let splat_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/splat.wgsl"));
         let splat_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("gpu_paint_splat_pipeline"),
             layout: Some(
@@ -256,10 +270,7 @@ impl GpuPaint {
                 storage_entry(3),
             ],
         });
-        let comp_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gpu_paint_comp"),
-            source: wgpu::ShaderSource::Wgsl(COMPOSITE_WGSL.into()),
-        });
+        let comp_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/composite.wgsl"));
         let comp_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("gpu_paint_comp_pipeline"),
             layout: Some(
@@ -278,6 +289,48 @@ impl GpuPaint {
         let brush_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpu_paint_brush_ubo"),
             size: std::mem::size_of::<BrushUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let stack_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gpu_paint_stack_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<StackUniforms>() as u64,
+                        ),
+                    },
+                    count: None,
+                },
+                tex_entry(1),
+                tex_entry(2),
+                storage_entry(3),
+            ],
+        });
+        let stack_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/stack.wgsl"));
+        let stack_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("gpu_paint_stack_pipeline"),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("gpu_paint_stack_pl"),
+                    bind_group_layouts: &[Some(&stack_bind_layout)],
+                    immediate_size: 0,
+                }),
+            ),
+            module: &stack_shader,
+            entry_point: Some("stack"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let stack_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_paint_stack_ubo"),
+            size: STACK_UBO_STRIDE * 8,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -308,6 +361,10 @@ impl GpuPaint {
             comp_pipeline,
             comp_bind_layout,
             brush_buf,
+            stack_pipeline,
+            stack_bind_layout,
+            stack_buf,
+            stack_buf_slots: 8,
             meshes: HashMap::new(),
         }
     }
@@ -772,6 +829,190 @@ impl GpuPaint {
             pass.dispatch_workgroups(tw.div_ceil(8), th.div_ceil(8), 1);
         }
     }
+
+    /// Clear a gpu-resident paint texture to transparent black.
+    pub fn clear_texture(&mut self, queue: &wgpu::Queue, tex: &wgpu::Texture, size: (u32, u32)) {
+        let (w, h) = (size.0.max(1), size.1.max(1));
+        let n = (w * h * 4) as usize;
+        if self.stroke_zeros.len() < n {
+            self.stroke_zeros.resize(n, 0);
+        }
+        write_paint_rgba(queue, tex, &self.stroke_zeros[..n], w, h);
+    }
+
+    /// Composite layer stack into `dst` (material map).
+    ///
+    /// `channel_mask` selects which RGB channels are written (albedo all; MR G/B).
+    /// Layers are bottom → top. Each layer is straight RGBA (A = coverage).
+    ///
+    /// Uniforms for every pass are written once into a strided UBO — `queue.write_buffer`
+    /// is not recorded in the encoder, so per-dispatch overwrites would make every
+    /// pass see only the last values (skipping base clear → layer stacks on itself).
+    pub fn composite_stack(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &wgpu::Texture,
+        size: (u32, u32),
+        base: [f32; 4],
+        channel_mask: [f32; 4],
+        layers: &[(&wgpu::Texture, f32)],
+    ) {
+        let (tw, th) = (size.0.max(1), size.1.max(1));
+        self.ensure_aux(device, tw, th);
+        let Some(paint_read) = self.paint_read.clone() else {
+            return;
+        };
+        let Some(paint_read_view) = self.paint_read_view.clone() else {
+            return;
+        };
+
+        let slots = 1 + layers.len() as u32;
+        self.ensure_stack_buf(device, slots);
+
+        // Pack all pass uniforms up-front (256-byte stride).
+        let mut blob = vec![0u8; (STACK_UBO_STRIDE as usize) * slots as usize];
+        let write_slot = |blob: &mut [u8], slot: u32, u: StackUniforms| {
+            let off = (slot as usize) * STACK_UBO_STRIDE as usize;
+            blob[off..off + std::mem::size_of::<StackUniforms>()]
+                .copy_from_slice(bytemuck::bytes_of(&u));
+        };
+        write_slot(
+            &mut blob,
+            0,
+            StackUniforms {
+                base,
+                channel_mask,
+                opacity: 1.0,
+                mode: 0,
+                tex_w: tw,
+                tex_h: th,
+            },
+        );
+        for (i, &(_, opacity)) in layers.iter().enumerate() {
+            write_slot(
+                &mut blob,
+                (i + 1) as u32,
+                StackUniforms {
+                    base,
+                    channel_mask,
+                    opacity: opacity.clamp(0.0, 1.0),
+                    mode: 1,
+                    tex_w: tw,
+                    tex_h: th,
+                },
+            );
+        }
+        queue.write_buffer(&self.stack_buf, 0, &blob);
+
+        let ubo_size = std::num::NonZeroU64::new(std::mem::size_of::<StackUniforms>() as u64);
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("gpu_paint_stack_dst"),
+            format: Some(wgpu::TextureFormat::Rgba8Unorm),
+            ..Default::default()
+        });
+
+        let dispatch = |encoder: &mut wgpu::CommandEncoder,
+                        slot: u32,
+                        layer_view: &wgpu::TextureView,
+                        stack_buf: &wgpu::Buffer,
+                        stack_layout: &wgpu::BindGroupLayout,
+                        pipeline: &wgpu::ComputePipeline| {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: dst,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &paint_read,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: tw,
+                    height: th,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gpu_paint_stack_bg"),
+                layout: stack_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: stack_buf,
+                            offset: 0,
+                            size: ubo_size,
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&paint_read_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(layer_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&dst_view),
+                    },
+                ],
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gpu_paint_stack"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bg, &[slot * STACK_UBO_STRIDE as u32]);
+                pass.dispatch_workgroups(tw.div_ceil(8), th.div_ceil(8), 1);
+            }
+        };
+
+        // 1) masked base
+        dispatch(
+            encoder,
+            0,
+            &paint_read_view,
+            &self.stack_buf,
+            &self.stack_bind_layout,
+            &self.stack_pipeline,
+        );
+
+        // 2) blend layers bottom → top
+        for (i, &(layer_tex, _)) in layers.iter().enumerate() {
+            let layer_view = layer_tex.create_view(&Default::default());
+            dispatch(
+                encoder,
+                (i + 1) as u32,
+                &layer_view,
+                &self.stack_buf,
+                &self.stack_bind_layout,
+                &self.stack_pipeline,
+            );
+        }
+    }
+
+    fn ensure_stack_buf(&mut self, device: &wgpu::Device, slots: u32) {
+        let slots = slots.max(1);
+        if slots <= self.stack_buf_slots {
+            return;
+        }
+        self.stack_buf_slots = slots.next_power_of_two().max(8);
+        self.stack_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_paint_stack_ubo"),
+            size: STACK_UBO_STRIDE * self.stack_buf_slots as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
 }
 
 fn ubo_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -890,188 +1131,3 @@ pub fn world_radius_to_px(world_r: f32, distance: f32, fov_y: f32, map_h: u32) -
     (world_r / world_h * map_h as f32).clamp(2.0, map_h as f32 * 0.75)
 }
 
-const UV_WGSL: &str = r#"
-struct Frame {
-    view_proj: mat4x4<f32>,
-    eye: vec3<f32>,
-    _pad: f32,
-}
-struct Object { model: mat4x4<f32>, }
-@group(0) @binding(0) var<uniform> frame: Frame;
-@group(1) @binding(0) var<uniform> object: Object;
-
-struct VsIn {
-    @location(0) pos: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) uv: vec2<f32>,
-}
-struct VsOut {
-    @builtin(position) clip: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) world_pos: vec3<f32>,
-    @location(2) world_n: vec3<f32>,
-}
-
-struct FsOut {
-    @location(0) uv_facing: vec4<f32>,
-    @location(1) world_pos: vec4<f32>,
-}
-
-@vertex
-fn vs_main(v: VsIn) -> VsOut {
-    var o: VsOut;
-    let world = object.model * vec4<f32>(v.pos, 1.0);
-    o.clip = frame.view_proj * world;
-    o.uv = v.uv;
-    o.world_pos = world.xyz;
-    // Rigid / uniform-scale friendly.
-    o.world_n = normalize((object.model * vec4<f32>(v.normal, 0.0)).xyz);
-    return o;
-}
-
-@fragment
-fn fs_main(i: VsOut) -> FsOut {
-    var o: FsOut;
-    let vdir = normalize(frame.eye - i.world_pos);
-    let facing = max(dot(normalize(i.world_n), vdir), 0.0);
-    o.uv_facing = vec4<f32>(i.uv, facing, 1.0);
-    o.world_pos = vec4<f32>(i.world_pos, 1.0);
-    return o;
-}
-"#;
-
-const SPLAT_WGSL: &str = r#"
-struct Brush {
-    center: vec2<f32>,
-    screen_radius: f32,
-    world_radius: f32,
-    hardness: f32,
-    _pad0: f32,
-    _pad_to_color: vec2<f32>,
-    color: vec4<f32>,
-    channel_mask: vec4<f32>,
-    opacity: f32,
-    _pad1: f32,
-    map_w: u32,
-    map_h: u32,
-    tex_w: u32,
-    tex_h: u32,
-    _pad_end: vec2<u32>,
-}
-
-@group(0) @binding(0) var<uniform> brush: Brush;
-@group(0) @binding(1) var uv_map: texture_2d<f32>;
-@group(0) @binding(2) var pos_map: texture_2d<f32>;
-@group(0) @binding(3) var stroke_dst: texture_storage_2d<rgba8unorm, write>;
-
-fn brush_cover(d: f32, radius: f32, hardness: f32) -> f32 {
-    if (d >= radius) { return 0.0; }
-    let inner = radius * hardness;
-    if (d <= inner) { return 1.0; }
-    let t = (1.0 - (d - inner) / max(radius - inner, 1e-4));
-    let s = clamp(t, 0.0, 1.0);
-    return s * s * (3.0 - 2.0 * s);
-}
-
-@compute @workgroup_size(8, 8)
-fn splat(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= brush.map_w || id.y >= brush.map_h) { return; }
-
-    let p = vec2<f32>(f32(id.x) + 0.5, f32(id.y) + 0.5);
-    // Screen window only culls work; falloff is world-space.
-    if (distance(p, brush.center) > brush.screen_radius * 1.25) { return; }
-
-    let cx = i32(floor(brush.center.x));
-    let cy = i32(floor(brush.center.y));
-    if (cx < 0 || cy < 0 || cx >= i32(brush.map_w) || cy >= i32(brush.map_h)) {
-        return;
-    }
-
-    let center_uv = textureLoad(uv_map, vec2<i32>(cx, cy), 0);
-    let center_pos = textureLoad(pos_map, vec2<i32>(cx, cy), 0);
-    // a=valid, b=facing
-    if (center_uv.a < 0.5 || center_pos.a < 0.5 || center_uv.b < 0.15) { return; }
-
-    let sample_uv = textureLoad(uv_map, vec2<i32>(i32(id.x), i32(id.y)), 0);
-    let sample_pos = textureLoad(pos_map, vec2<i32>(i32(id.x), i32(id.y)), 0);
-    if (sample_uv.a < 0.5 || sample_pos.a < 0.5) { return; }
-
-    let facing = sample_uv.b;
-    if (facing < 0.15) { return; }
-    let facing_fade = clamp((facing - 0.15) / 0.85, 0.0, 1.0);
-
-    // Reject depth jumps (front leaking onto far/back geometry in the same brush window).
-    let world_d = distance(sample_pos.xyz, center_pos.xyz);
-    if (world_d > brush.world_radius) { return; }
-
-    let cover = brush_cover(world_d, brush.world_radius, brush.hardness) * facing_fade;
-    if (cover < 0.001) { return; }
-
-    let uv = clamp(sample_uv.xy, vec2<f32>(0.0), vec2<f32>(0.99999));
-    let tc = vec2<i32>(
-        i32(floor(uv.x * f32(brush.tex_w))),
-        i32(floor(uv.y * f32(brush.tex_h))),
-    );
-    let a = cover * brush.opacity;
-    textureStore(stroke_dst, tc, vec4<f32>(brush.color.rgb, a));
-}
-"#;
-
-const COMPOSITE_WGSL: &str = r#"
-struct Brush {
-    center: vec2<f32>,
-    screen_radius: f32,
-    world_radius: f32,
-    hardness: f32,
-    _pad0: f32,
-    _pad_to_color: vec2<f32>,
-    color: vec4<f32>,
-    channel_mask: vec4<f32>,
-    opacity: f32,
-    _pad1: f32,
-    map_w: u32,
-    map_h: u32,
-    tex_w: u32,
-    tex_h: u32,
-    _pad_end: vec2<u32>,
-}
-
-@group(0) @binding(0) var<uniform> brush: Brush;
-@group(0) @binding(1) var paint_src: texture_2d<f32>;
-@group(0) @binding(2) var stroke_src: texture_2d<f32>;
-@group(0) @binding(3) var paint_dst: texture_storage_2d<rgba8unorm, write>;
-
-@compute @workgroup_size(8, 8)
-fn composite(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= brush.tex_w || id.y >= brush.tex_h) { return; }
-    let tc = vec2<i32>(i32(id.x), i32(id.y));
-    let src = textureLoad(paint_src, tc, 0);
-
-    // Tiny seam pad only — large dilate was leaking into back-side UV islands.
-    let R = 1;
-    var best_a = 0.0;
-    var best_rgb = vec3<f32>(0.0);
-    for (var dy = -R; dy <= R; dy++) {
-        for (var dx = -R; dx <= R; dx++) {
-            let q = tc + vec2(dx, dy);
-            if (q.x < 0 || q.y < 0 || q.x >= i32(brush.tex_w) || q.y >= i32(brush.tex_h)) {
-                continue;
-            }
-            let s = textureLoad(stroke_src, q, 0);
-            if (s.a > best_a) {
-                best_a = s.a;
-                best_rgb = s.rgb;
-            }
-        }
-    }
-
-    if (best_a < 0.001) {
-        textureStore(paint_dst, tc, src);
-        return;
-    }
-    let mask = brush.channel_mask.rgb;
-    let out_rgb = mix(src.rgb, best_rgb, best_a * mask);
-    let out_a = max(src.a, best_a);
-    textureStore(paint_dst, tc, vec4<f32>(out_rgb, out_a));
-}
-"#;
