@@ -5,16 +5,23 @@ use std::time::Instant;
 
 use glam::{Mat4, Vec2, Vec3};
 use mega_render::{
-    cube, load_gltf, plane, sphere, Camera, Handle, InputFrame, Light, Material, Mesh, Node, Scene,
-    Texture, Transform,
+    cube, load_gltf, plane, sphere, Camera, DebugView, Handle, InputFrame, Light, Material, Mesh,
+    Node, Scene, Texture, Transform,
 };
 use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
 
-use crate::paint::{Brush, PaintDocument, TEX_SIZE};
+use crate::paint::{Brush, PaintDocument, PaintMap, TEX_SIZE};
 use crate::pick::{self, BvhCache};
 use mega_ui::Rect;
 
 pub const SCENE_TEX: u32 = 0;
+
+const VIEW_MODES: &[DebugView] = &[
+    DebugView::Final,
+    DebugView::Albedo,
+    DebugView::Metallic,
+    DebugView::Roughness,
+];
 
 #[derive(Clone, Copy)]
 pub struct PendingStamp {
@@ -26,9 +33,12 @@ pub struct PendingStamp {
 
 pub struct Painter {
     pub scene: Scene,
-    pub doc: PaintDocument,
+    pub docs: [PaintDocument; 3],
+    pub paint_map: PaintMap,
+    pub debug_view: DebugView,
     pub brush: Brush,
     pub albedo_tex: Handle<Texture>,
+    pub mr_tex: Handle<Texture>,
     pub paintable: Vec<Handle<Node>>,
     pub dock: DockState,
     pub viewport_size: Vec2,
@@ -42,7 +52,9 @@ pub struct Painter {
     pub model_name: String,
     pub status: String,
     /// Layer stack changed — re-upload composite into gpu-resident albedo.
-    pub needs_gpu_paint_upload: bool,
+    pub needs_gpu_albedo_upload: bool,
+    /// Layer stack changed — re-upload MR channels into gpu-resident map.
+    pub needs_gpu_mr_upload: bool,
     pending_stamps: Vec<PendingStamp>,
     last_stamp_px: Option<Vec2>,
     root: Handle<Node>,
@@ -51,6 +63,8 @@ pub struct Painter {
     cube_node: Handle<Node>,
     model_root: Option<Handle<Node>>,
     bvh_cache: BvhCache,
+    /// Scratch for MR channel composite from a grayscale layer stack.
+    mr_scratch: Vec<u8>,
 }
 
 impl Painter {
@@ -63,14 +77,30 @@ impl Painter {
         }
         scene.ambient = [0.08, 0.08, 0.09];
 
-        let doc = PaintDocument::new(TEX_SIZE, TEX_SIZE);
+        let rough_u8 = (0.45 * 255.0) as u8;
+        let docs = [
+            PaintDocument::new(TEX_SIZE, TEX_SIZE),
+            PaintDocument::with_base(TEX_SIZE, TEX_SIZE, [0, 0, 0]),
+            PaintDocument::with_base(TEX_SIZE, TEX_SIZE, [rough_u8, rough_u8, rough_u8]),
+        ];
+
         let mut albedo = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, true);
-        doc.composite_into(&mut albedo.rgba);
+        docs[0].composite_into(&mut albedo.rgba);
         let albedo_tex = scene.textures.insert(albedo);
 
-        let paint_mat = scene.materials.insert(
-            Material::new([1.0, 1.0, 1.0, 1.0], 0.0, 0.45).with_map(albedo_tex),
-        );
+        // glTF ORM: R unused, G=roughness, B=metallic. Scalars on material = 1 so map wins.
+        let mut mr = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false);
+        for px in mr.rgba.chunks_exact_mut(4) {
+            px[0] = 255;
+            px[1] = rough_u8;
+            px[2] = 0;
+            px[3] = 255;
+        }
+        let mr_tex = scene.textures.insert(mr);
+
+        let mut paint_mat_data = Material::new([1.0, 1.0, 1.0, 1.0], 1.0, 1.0).with_map(albedo_tex);
+        paint_mat_data.metallic_roughness_map = Some(mr_tex);
+        let paint_mat = scene.materials.insert(paint_mat_data);
         let ground_mat = scene
             .materials
             .insert(Material::new([0.35, 0.36, 0.38, 1.0], 0.0, 0.85));
@@ -121,16 +151,19 @@ impl Painter {
 
         let mut painter = Self {
             scene,
-            doc,
+            docs,
+            paint_map: PaintMap::Albedo,
+            debug_view: DebugView::Final,
             brush: Brush::default(),
             albedo_tex,
+            mr_tex,
             paintable: vec![sphere_node],
             dock: DockState::new(DockNode::split_h(
                 0.72,
                 DockNode::leaf(&["Viewport"]),
                 DockNode::split_v(
                     0.55,
-                    DockNode::leaf(&["Brush"]),
+                    DockNode::leaf(&["Brush", "Lights"]),
                     DockNode::leaf(&["Layers"]),
                 ),
             )),
@@ -143,7 +176,8 @@ impl Painter {
             shape: 0,
             model_name: String::new(),
             status: "Ready · GPU brush".into(),
-            needs_gpu_paint_upload: false,
+            needs_gpu_albedo_upload: false,
+            needs_gpu_mr_upload: false,
             pending_stamps: Vec::new(),
             last_stamp_px: None,
             root,
@@ -152,10 +186,41 @@ impl Painter {
             cube_node,
             model_root: None,
             bvh_cache: HashMap::new(),
+            mr_scratch: vec![0; (TEX_SIZE * TEX_SIZE * 4) as usize],
         };
         painter.rebuild_bvhs();
         painter.apply_camera();
         painter
+    }
+
+    pub fn doc(&self) -> &PaintDocument {
+        &self.docs[self.paint_map.index()]
+    }
+
+    pub fn doc_mut(&mut self) -> &mut PaintDocument {
+        &mut self.docs[self.paint_map.index()]
+    }
+
+    pub fn paint_tex(&self) -> Handle<Texture> {
+        match self.paint_map {
+            PaintMap::Albedo => self.albedo_tex,
+            PaintMap::Metallic | PaintMap::Roughness => self.mr_tex,
+        }
+    }
+
+    /// Grayscale brush color for metallic / roughness stamps.
+    pub fn stamp_brush(&self) -> Brush {
+        match self.paint_map {
+            PaintMap::Albedo => self.brush,
+            PaintMap::Metallic | PaintMap::Roughness => {
+                let c = self.brush.color;
+                let v = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+                Brush {
+                    color: [v, v, v, 1.0],
+                    ..self.brush
+                }
+            }
+        }
     }
 
     pub fn apply_camera(&mut self) {
@@ -226,7 +291,6 @@ impl Painter {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
                 self.model_name = name.clone();
-                // status may already say BVH ready from set_shape
                 if !self.status.starts_with("BVH") {
                     self.status = format!("Loaded {name}");
                 } else {
@@ -240,7 +304,6 @@ impl Painter {
     }
 
     fn load_gltf_path(&mut self, path: &Path) -> Result<(), String> {
-        // Hide / drop previous model subtree (nodes only; assets may linger).
         if let Some(old) = self.model_root.take() {
             remove_subtree(&mut self.scene, old);
         }
@@ -248,7 +311,7 @@ impl Painter {
         let root = load_gltf(&mut self.scene, path, Some(self.root))?;
         self.model_root = Some(root);
 
-        // Wire paint albedo onto every mesh material (keeps metal/rough from glTF).
+        // Wire paint maps onto every mesh material.
         let mesh_nodes = collect_mesh_nodes(&self.scene, Some(root));
         let mut touched = std::collections::HashSet::new();
         for &h in &mesh_nodes {
@@ -270,17 +333,39 @@ impl Painter {
             if let Some(mat) = self.scene.materials.get_mut(mat_h) {
                 mat.albedo = [1.0, 1.0, 1.0, 1.0];
                 mat.albedo_map = Some(self.albedo_tex);
+                mat.metallic = 1.0;
+                mat.roughness = 1.0;
+                mat.metallic_roughness_map = Some(self.mr_tex);
             }
         }
 
-        // Fresh paint stack for the new mesh.
-        self.doc = PaintDocument::new(TEX_SIZE, TEX_SIZE);
-        self.doc.mark_dirty();
-        self.needs_gpu_paint_upload = true;
-
+        self.reset_paint_docs();
         self.fit_to_nodes(&mesh_nodes);
         self.set_shape(2);
         Ok(())
+    }
+
+    fn reset_paint_docs(&mut self) {
+        let rough_u8 = (0.45 * 255.0) as u8;
+        self.docs = [
+            PaintDocument::new(TEX_SIZE, TEX_SIZE),
+            PaintDocument::with_base(TEX_SIZE, TEX_SIZE, [0, 0, 0]),
+            PaintDocument::with_base(TEX_SIZE, TEX_SIZE, [rough_u8, rough_u8, rough_u8]),
+        ];
+        for d in &mut self.docs {
+            d.mark_dirty();
+        }
+        self.needs_gpu_albedo_upload = true;
+        self.needs_gpu_mr_upload = true;
+
+        if let Some(mr) = self.scene.textures.get_mut(self.mr_tex) {
+            for px in mr.rgba.chunks_exact_mut(4) {
+                px[0] = 255;
+                px[1] = rough_u8;
+                px[2] = 0;
+                px[3] = 255;
+            }
+        }
     }
 
     fn fit_to_nodes(&mut self, nodes: &[Handle<Node>]) {
@@ -298,16 +383,41 @@ impl Painter {
         self.apply_camera();
     }
 
-    pub fn sync_albedo_if_dirty(&mut self) {
-        let Some(rect) = self.doc.take_dirty_rect() else {
-            return;
-        };
-        let Some(tex) = self.scene.textures.get_mut(self.albedo_tex) else {
-            return;
-        };
-        self.doc.composite_rect(&mut tex.rgba, rect);
-        // gpu_resident: host uploads via write_paint_rgba after sync.
-        self.needs_gpu_paint_upload = true;
+    pub fn sync_paint_if_dirty(&mut self) {
+        // Albedo stack
+        if let Some(rect) = self.docs[0].take_dirty_rect() {
+            if let Some(tex) = self.scene.textures.get_mut(self.albedo_tex) {
+                self.docs[0].composite_rect(&mut tex.rgba, rect);
+                self.needs_gpu_albedo_upload = true;
+            }
+        }
+
+        // Metallic / roughness → MR channels (B / G)
+        for map in [PaintMap::Metallic, PaintMap::Roughness] {
+            let Some(channel) = map.mr_channel() else {
+                continue;
+            };
+            let idx = map.index();
+            let Some(rect) = self.docs[idx].take_dirty_rect() else {
+                continue;
+            };
+            self.docs[idx].composite_rect(&mut self.mr_scratch, rect);
+            let Some(tex) = self.scene.textures.get_mut(self.mr_tex) else {
+                continue;
+            };
+            let w = TEX_SIZE;
+            let x0 = rect.x0.min(w.saturating_sub(1));
+            let y0 = rect.y0.min(w.saturating_sub(1));
+            let x1 = rect.x1.min(w.saturating_sub(1));
+            let y1 = rect.y1.min(w.saturating_sub(1));
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let i = ((y * w + x) * 4) as usize;
+                    tex.rgba[i + channel] = self.mr_scratch[i];
+                }
+            }
+            self.needs_gpu_mr_upload = true;
+        }
     }
 
     pub fn take_pending_stamps(&mut self) -> Vec<PendingStamp> {
@@ -315,7 +425,6 @@ impl Painter {
     }
 
     pub fn paint_at(&mut self, screen: Vec2, viewport: mega_ui::Rect) {
-        // Screen-space GPU brush — queue a stamp; executed after visualizer.sync.
         let local = Vec2::new(
             (screen.x - viewport.min.x).clamp(0.0, viewport.width().max(1.0)),
             (screen.y - viewport.min.y).clamp(0.0, viewport.height().max(1.0)),
@@ -452,16 +561,14 @@ impl Painter {
 
     pub fn end_stroke(&mut self) {
         self.last_stamp_px = None;
-        self.doc.end_stroke();
+        self.doc_mut().end_stroke();
     }
 
     pub fn pan_camera(&mut self, dx: f32, dy: f32) {
-        // Same camera-plane basis as map-editor fly pan (LH).
         let eye = self.scene.camera.eye;
         let f = (self.orbit_target - eye).normalize_or_zero();
         let mut r = Vec3::Y.cross(f).normalize_or_zero();
         if r.length_squared() < 1e-8 {
-            // Looking straight up/down — use yaw tangent.
             let yaw = self.orbit_yaw;
             r = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
         }
@@ -482,17 +589,20 @@ impl Painter {
         let mut clear_layer = false;
         let mut move_up = false;
         let mut move_down = false;
-        let mut active = self.doc.active;
+        let mut active = self.doc().active;
         let mut dirty_layers = false;
         let mut open_model = false;
+        let mut paint_map = self.paint_map;
+        let mut debug_view = self.debug_view;
         let has_model = self.model_root.is_some();
 
         {
             let dock = &mut self.dock;
             let viewport_size = &mut self.viewport_size;
             let brush = &mut self.brush;
-            let layers = &mut self.doc.layers;
+            let docs = &mut self.docs;
             let model_name = self.model_name.as_str();
+            let scene = &mut self.scene;
 
             ui.dock_space("main", dock_size, dock, |ui, tab| match tab {
                 "Viewport" => {
@@ -504,6 +614,20 @@ impl Painter {
                         },
                     );
                     ui.separator();
+                    ui.label("View");
+                    let mut view_idx = VIEW_MODES
+                        .iter()
+                        .position(|v| *v == debug_view)
+                        .unwrap_or(0);
+                    let view_labels: Vec<&str> = VIEW_MODES.iter().map(|v| v.label()).collect();
+                    if ui
+                        .toggle("debug_view", &mut view_idx, &view_labels)
+                        .changed()
+                    {
+                        debug_view = VIEW_MODES[view_idx];
+                        keep = true;
+                    }
+                    ui.separator();
                     let size = ui.available_size();
                     *viewport_size = size;
                     ui.texture(SCENE_TEX, size);
@@ -511,9 +635,13 @@ impl Painter {
                 "Brush" => {
                     ui.label("Brush");
                     ui.separator();
+                    ui.label("Color — stamp tint (MR maps use luminance)");
                     ui.color_edit("color", &mut brush.color);
+                    ui.label("Radius — world-space stamp size");
                     ui.slider("radius", &mut brush.radius, 0.01..=0.35);
+                    ui.label("Hardness — 0 soft falloff · 1 hard edge");
                     ui.slider("hardness", &mut brush.hardness, 0.0..=1.0);
+                    ui.label("Opacity — stroke strength");
                     ui.slider("opacity", &mut brush.opacity, 0.05..=1.0);
                     ui.separator();
                     ui.label("Mesh");
@@ -534,57 +662,131 @@ impl Painter {
                         ui.label(model_name);
                     }
                 }
+                "Lights" => {
+                    ui.label("Lights");
+                    ui.separator();
+                    ui.label("Ambient");
+                    let mut amb = [scene.ambient[0], scene.ambient[1], scene.ambient[2], 1.0];
+                    if ui.color_edit("ambient", &mut amb).changed() {
+                        scene.ambient = [amb[0], amb[1], amb[2]];
+                        keep = true;
+                    }
+                    if let Some(Light::Directional(d)) = scene.lights.first_mut() {
+                        ui.separator();
+                        ui.label("Directional");
+                        if ui.checkbox("Cast shadows", &mut d.cast_shadows).changed() {
+                            keep = true;
+                        }
+                        ui.label("Intensity");
+                        if ui
+                            .slider("light_intensity", &mut d.intensity, 0.0..=8.0)
+                            .changed()
+                        {
+                            keep = true;
+                        }
+                        ui.label("Color");
+                        let mut col = [d.color[0], d.color[1], d.color[2], 1.0];
+                        if ui.color_edit("sun_color", &mut col).changed() {
+                            d.color = [col[0], col[1], col[2]];
+                            keep = true;
+                        }
+                        ui.label("Direction (world)");
+                        if ui
+                            .slider("dir_x", &mut d.direction.x, -1.0..=1.0)
+                            .changed()
+                            || ui
+                                .slider("dir_y", &mut d.direction.y, -1.0..=1.0)
+                                .changed()
+                            || ui
+                                .slider("dir_z", &mut d.direction.z, -1.0..=1.0)
+                                .changed()
+                        {
+                            keep = true;
+                        }
+                    }
+                }
                 "Layers" => {
-                    ui.label("Layers");
+                    ui.label("Paint map");
+                    let mut map_idx = paint_map.index();
+                    let map_labels: Vec<&str> = PaintMap::ALL.iter().map(|m| m.label()).collect();
+                    if ui.toggle("paint_map", &mut map_idx, &map_labels).changed() {
+                        paint_map = PaintMap::ALL[map_idx];
+                        active = docs[paint_map.index()].active;
+                        keep = true;
+                    }
                     ui.separator();
                     ui.row(|ui| {
-                        if ui.button("+").clicked() {
+                        if ui
+                            .button_with("add_layer", |ui| {
+                                ui.icon("plus", 14.0);
+                            })
+                            .clicked()
+                        {
                             add_layer = true;
                         }
-                        if ui.button("-").clicked() {
+                        if ui
+                            .button_with("del_layer", |ui| {
+                                ui.icon("delete", 14.0);
+                            })
+                            .clicked()
+                        {
                             del_layer = true;
                         }
-                        if ui.button("Clear").clicked() {
+                        if ui
+                            .button_with("clear_layer", |ui| {
+                                ui.icon("reset", 14.0);
+                            })
+                            .clicked()
+                        {
                             clear_layer = true;
                         }
-                        if ui.button("Up").clicked() {
+                        if ui
+                            .button_with("layer_up", |ui| {
+                                ui.icon("chevron_up", 14.0);
+                            })
+                            .clicked()
+                        {
                             move_up = true;
                         }
-                        if ui.button("Dn").clicked() {
+                        if ui
+                            .button_with("layer_dn", |ui| {
+                                ui.icon("chevron_down", 14.0);
+                            })
+                            .clicked()
+                        {
                             move_down = true;
                         }
                     });
                     ui.separator();
+                    let layers = &mut docs[paint_map.index()].layers;
                     let size = ui.available_size();
                     ui.scroll_area("layers", size, ScrollAxes::Vertical, |ui| {
                         for i in (0..layers.len()).rev() {
                             let is_active = i == active;
                             let name = layers[i].name.clone();
-                            let label = if is_active {
-                                format!("> {name}")
-                            } else {
-                                format!("  {name}")
-                            };
-                            ui.row(|ui| {
-                                if ui.button(&label).clicked() {
-                                    active = i;
-                                }
+                            ui.group(&name, |ui| {
+                                let label = if is_active { "> active" } else { "Select" };
+                                ui.row(|ui| {
+                                    if ui.button(label).clicked() {
+                                        active = i;
+                                    }
+                                    if ui
+                                        .checkbox(&format!("vis{i}"), &mut layers[i].visible)
+                                        .changed()
+                                    {
+                                        dirty_layers = true;
+                                        keep = true;
+                                    }
+                                });
+                                ui.label("Opacity");
                                 if ui
-                                    .checkbox(&format!("vis{i}"), &mut layers[i].visible)
+                                    .slider(&format!("op{i}"), &mut layers[i].opacity, 0.0..=1.0)
                                     .changed()
                                 {
                                     dirty_layers = true;
                                     keep = true;
                                 }
                             });
-                            if ui
-                                .slider(&format!("op{i}"), &mut layers[i].opacity, 0.0..=1.0)
-                                .changed()
-                            {
-                                dirty_layers = true;
-                                keep = true;
-                            }
-                            ui.separator();
                         }
                     });
                 }
@@ -596,32 +798,38 @@ impl Painter {
             ui.label(&self.status);
         });
 
+        if paint_map != self.paint_map {
+            self.paint_map = paint_map;
+            active = self.doc().active;
+        }
+        self.debug_view = debug_view;
+
         if open_model {
             self.open_model_dialog();
             keep = true;
         } else if shape != self.shape {
             self.set_shape(shape);
         }
-        if active != self.doc.active && active < self.doc.layers.len() {
-            self.doc.active = active;
+        if active != self.doc().active && active < self.doc().layers.len() {
+            self.doc_mut().active = active;
         }
         if dirty_layers {
-            self.doc.mark_dirty();
+            self.doc_mut().mark_dirty();
         }
         if add_layer {
-            self.doc.add_layer();
+            self.doc_mut().add_layer();
         }
         if del_layer {
-            self.doc.remove_active();
+            self.doc_mut().remove_active();
         }
         if clear_layer {
-            self.doc.clear_active();
+            self.doc_mut().clear_active();
         }
         if move_up {
-            self.doc.move_active(1);
+            self.doc_mut().move_active(1);
         }
         if move_down {
-            self.doc.move_active(-1);
+            self.doc_mut().move_active(-1);
         }
 
         keep || self.painting
@@ -677,7 +885,6 @@ fn remove_subtree(scene: &mut Scene, root: Handle<Node>) {
             .collect();
         stack.extend(children);
     }
-    // children first
     for h in order.into_iter().rev() {
         scene.nodes.remove(h);
     }

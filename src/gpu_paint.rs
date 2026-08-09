@@ -58,6 +58,8 @@ struct BrushUniforms {
     /// WGSL uniform `vec4` aligns to 16 — pad 8 bytes after the f32 pair above.
     _pad_to_color: [f32; 2],
     color: [f32; 4],
+    /// Per-channel write mask (albedo 1,1,1; roughness 0,1,0; metallic 0,0,1).
+    channel_mask: [f32; 4],
     opacity: f32,
     _pad1: f32,
     map_w: u32,
@@ -608,6 +610,7 @@ impl GpuPaint {
         paint_tex: &wgpu::Texture,
         paint_size: (u32, u32),
         brush: &Brush,
+        channel_mask: [f32; 4],
         center_px: Vec2,
         screen_radius_px: f32,
         world_radius: f32,
@@ -689,6 +692,7 @@ impl GpuPaint {
             _pad0: 0.0,
             _pad_to_color: [0.0; 2],
             color: brush.color,
+            channel_mask,
             opacity: brush.opacity.clamp(0.0, 1.0),
             _pad1: 0.0,
             map_w: mw,
@@ -945,6 +949,7 @@ struct Brush {
     _pad0: f32,
     _pad_to_color: vec2<f32>,
     color: vec4<f32>,
+    channel_mask: vec4<f32>,
     opacity: f32,
     _pad1: f32,
     map_w: u32,
@@ -1021,6 +1026,7 @@ struct Brush {
     _pad0: f32,
     _pad_to_color: vec2<f32>,
     color: vec4<f32>,
+    channel_mask: vec4<f32>,
     opacity: f32,
     _pad1: f32,
     map_w: u32,
@@ -1063,7 +1069,8 @@ fn composite(@builtin(global_invocation_id) id: vec3<u32>) {
         textureStore(paint_dst, tc, src);
         return;
     }
-    let out_rgb = mix(src.rgb, best_rgb, best_a);
+    let mask = brush.channel_mask.rgb;
+    let out_rgb = mix(src.rgb, best_rgb, best_a * mask);
     let out_a = max(src.a, best_a);
     textureStore(paint_dst, tc, vec4<f32>(out_rgb, out_a));
 }

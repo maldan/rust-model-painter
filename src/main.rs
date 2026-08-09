@@ -437,7 +437,7 @@ impl Host {
             }
         }
 
-        self.painter.sync_albedo_if_dirty();
+        self.painter.sync_paint_if_dirty();
         self.animating =
             keep_ui || self.looking || self.panning || self.painter.painting || out.needs_repaint;
 
@@ -474,9 +474,10 @@ impl Host {
             gpu.visualizer.ensure_target(vp_w, vp_h);
 
             gpu.visualizer.sync(&self.painter.scene);
+            gpu.visualizer.set_debug_view(self.painter.debug_view);
 
-            // Layer/CPU recompose → push into gpu-resident paint map.
-            if self.painter.needs_gpu_paint_upload {
+            // Layer/CPU recompose → push into gpu-resident paint maps.
+            if self.painter.needs_gpu_albedo_upload {
                 let paint_tex = gpu
                     .visualizer
                     .texture_gpu(self.painter.albedo_tex)
@@ -492,7 +493,22 @@ impl Host {
                         );
                     }
                 }
-                self.painter.needs_gpu_paint_upload = false;
+                self.painter.needs_gpu_albedo_upload = false;
+            }
+            if self.painter.needs_gpu_mr_upload {
+                let paint_tex = gpu.visualizer.texture_gpu(self.painter.mr_tex).cloned();
+                if let Some(paint_tex) = paint_tex {
+                    if let Some(cpu) = self.painter.scene.textures.get(self.painter.mr_tex) {
+                        write_paint_rgba(
+                            &gpu.queue,
+                            &paint_tex,
+                            &cpu.rgba,
+                            cpu.width,
+                            cpu.height,
+                        );
+                    }
+                }
+                self.painter.needs_gpu_mr_upload = false;
             }
 
             let stamps = self.painter.take_pending_stamps();
@@ -514,15 +530,13 @@ impl Host {
                     aspect,
                 );
 
-                let paint_tex = gpu
-                    .visualizer
-                    .texture_gpu(self.painter.albedo_tex)
-                    .cloned();
+                let target = self.painter.paint_tex();
+                let paint_tex = gpu.visualizer.texture_gpu(target).cloned();
+                let stamp_brush = self.painter.stamp_brush();
+                let channel_mask = self.painter.paint_map.channel_mask();
                 if let Some(paint_tex) = paint_tex {
                     for stamp in &stamps {
                         let center = cursor_to_map_px(stamp.screen, stamp.viewport, vp_w, vp_h);
-                        // Generous screen window: face-on size at hit depth, plus margin for
-                        // grazing angles (world circle elongates on screen).
                         let screen_r = (stamp.screen_radius_px * 2.0).max(4.0);
                         gpu.gpu_paint.stamp(
                             &gpu.device,
@@ -530,10 +544,11 @@ impl Host {
                             &mut encoder,
                             &paint_tex,
                             (TEX_SIZE, TEX_SIZE),
-                            &self.painter.brush,
+                            &stamp_brush,
+                            channel_mask,
                             center,
                             screen_r,
-                            self.painter.brush.radius,
+                            stamp_brush.radius,
                         );
                     }
                 }

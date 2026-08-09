@@ -59,6 +59,55 @@ impl Layer {
     }
 }
 
+/// Which material map the brush / layer stack targets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PaintMap {
+    #[default]
+    Albedo,
+    Metallic,
+    Roughness,
+}
+
+impl PaintMap {
+    pub const ALL: &'static [PaintMap] =
+        &[PaintMap::Albedo, PaintMap::Metallic, PaintMap::Roughness];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PaintMap::Albedo => "Albedo",
+            PaintMap::Metallic => "Metallic",
+            PaintMap::Roughness => "Roughness",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            PaintMap::Albedo => 0,
+            PaintMap::Metallic => 1,
+            PaintMap::Roughness => 2,
+        }
+    }
+
+    /// RGB write mask for GPU composite (glTF MR: G=roughness, B=metallic).
+    pub fn channel_mask(self) -> [f32; 4] {
+        match self {
+            PaintMap::Albedo => [1.0, 1.0, 1.0, 1.0],
+            PaintMap::Roughness => [0.0, 1.0, 0.0, 0.0],
+            PaintMap::Metallic => [0.0, 0.0, 1.0, 0.0],
+        }
+    }
+
+    /// MR texture channel for CPU layer sync (None = full albedo RGBA).
+    pub fn mr_channel(self) -> Option<usize> {
+        match self {
+            PaintMap::Albedo => None,
+            PaintMap::Roughness => Some(1),
+            PaintMap::Metallic => Some(2),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct Brush {
     pub color: [f32; 4],
     /// World-space radius.
@@ -84,6 +133,8 @@ impl Default for Brush {
 pub struct PaintDocument {
     pub width: u32,
     pub height: u32,
+    /// Underpaint when layers are transparent.
+    pub base_rgb: [u8; 3],
     pub layers: Vec<Layer>,
     pub active: usize,
     /// Last stamp world position for stroke spacing.
@@ -95,9 +146,14 @@ pub struct PaintDocument {
 
 impl PaintDocument {
     pub fn new(width: u32, height: u32) -> Self {
+        Self::with_base(width, height, [220, 220, 225])
+    }
+
+    pub fn with_base(width: u32, height: u32, base_rgb: [u8; 3]) -> Self {
         Self {
             width,
             height,
+            base_rgb,
             layers: vec![Layer::new("Layer 1", width, height)],
             active: 0,
             last_pos: None,
@@ -346,9 +402,9 @@ impl PaintDocument {
         for y in y0..=y1 {
             for x in x0..=x1 {
                 let i = ((y * w + x) * 4) as usize;
-                let mut r = 220u8;
-                let mut g = 220u8;
-                let mut b = 225u8;
+                let mut r = self.base_rgb[0];
+                let mut g = self.base_rgb[1];
+                let mut b = self.base_rgb[2];
 
                 for layer in &self.layers {
                     if !layer.visible || layer.opacity <= 0.001 {
