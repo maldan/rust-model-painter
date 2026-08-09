@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::f32::consts::TAU;
 use std::path::Path;
 use std::time::Instant;
 
-use glam::{Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 use mega_render::{
-    cube, load_gltf, plane, sphere, Camera, Handle, Light, Material, Mesh, Node, Scene, Texture,
-    Transform,
+    cube, load_gltf, plane, sphere, Camera, Handle, InputFrame, Light, Material, Mesh, Node, Scene,
+    Texture, Transform,
 };
 use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
 
@@ -19,6 +20,8 @@ pub const SCENE_TEX: u32 = 0;
 pub struct PendingStamp {
     pub screen: Vec2,
     pub viewport: Rect,
+    /// Screen-space search radius at stamp depth (viewport pixels).
+    pub screen_radius_px: f32,
 }
 
 pub struct Painter {
@@ -317,20 +320,134 @@ impl Painter {
             (screen.x - viewport.min.x).clamp(0.0, viewport.width().max(1.0)),
             (screen.y - viewport.min.y).clamp(0.0, viewport.height().max(1.0)),
         );
-        let map_h = self.viewport_size.y.round().max(1.0) as u32;
-        let radius_px = crate::gpu_paint::world_radius_to_px(
-            self.brush.radius,
-            self.orbit_dist,
-            self.scene.camera.fov_y,
-            map_h,
-        );
+        let radius_px = self.brush_radius_px_at(screen, viewport);
         if let Some(prev) = self.last_stamp_px {
             if prev.distance(local) < radius_px * self.brush.spacing {
                 return;
             }
         }
         self.last_stamp_px = Some(local);
-        self.pending_stamps.push(PendingStamp { screen, viewport });
+        self.pending_stamps.push(PendingStamp {
+            screen,
+            viewport,
+            screen_radius_px: radius_px,
+        });
+    }
+
+    /// Face-on screen size of `brush.radius` at the surface under `screen` (or orbit fallback).
+    pub fn brush_radius_px_at(&mut self, screen: Vec2, viewport: Rect) -> f32 {
+        let map_h = self.viewport_size.y.round().max(1.0) as u32;
+        let dist = self
+            .pick_distance(screen, viewport)
+            .unwrap_or(self.orbit_dist);
+        crate::gpu_paint::world_radius_to_px(
+            self.brush.radius,
+            dist,
+            self.scene.camera.fov_y,
+            map_h,
+        )
+    }
+
+    fn pick_distance(&mut self, screen: Vec2, viewport: Rect) -> Option<f32> {
+        let aspect = (self.viewport_size.x / self.viewport_size.y.max(1.0)).max(1e-4);
+        let view_proj = self.scene.camera.view_proj(aspect);
+        let (origin, dir) =
+            pick::screen_ray(screen, viewport, self.scene.camera.eye, view_proj.inverse());
+        pick::ensure_bvhs(&self.scene, &self.paintable, &mut self.bvh_cache);
+        let hit = pick::pick_mesh(
+            &self.scene,
+            origin,
+            dir,
+            &self.paintable,
+            &self.bvh_cache,
+        )?;
+        Some(hit.position.distance(self.scene.camera.eye).max(0.05))
+    }
+
+    /// Brush cursor into `scene.hud` (viewport pixel space, drawn with the scene).
+    pub fn update_brush_cursor(&mut self, screen: Vec2, viewport: Rect, show: bool) {
+        let hud_size = Vec2::new(
+            self.viewport_size.x.round().max(1.0),
+            self.viewport_size.y.round().max(1.0),
+        );
+        let input = InputFrame {
+            cursor: crate::gpu_paint::cursor_to_map_px(
+                screen,
+                viewport,
+                hud_size.x as u32,
+                hud_size.y as u32,
+            ),
+            ..Default::default()
+        };
+        self.scene.hud.begin(&input, hud_size);
+        if show {
+            self.draw_brush_cursor(screen, viewport, hud_size);
+        }
+        let _ = self.scene.hud.end();
+    }
+
+    fn draw_brush_cursor(&mut self, screen: Vec2, viewport: Rect, hud_size: Vec2) {
+        const COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.92];
+        const SEGMENTS: u32 = 48;
+        const CROSS: f32 = 4.0;
+
+        let aspect = hud_size.x / hud_size.y.max(1.0);
+        let view_proj = self.scene.camera.view_proj(aspect);
+        let (origin, dir) = pick::screen_ray(
+            screen,
+            viewport,
+            self.scene.camera.eye,
+            view_proj.inverse(),
+        );
+        pick::ensure_bvhs(&self.scene, &self.paintable, &mut self.bvh_cache);
+        let hit = pick::pick_mesh(
+            &self.scene,
+            origin,
+            dir,
+            &self.paintable,
+            &self.bvh_cache,
+        );
+
+        let (center_hud, ring_hud) = if let Some(hit) = hit {
+            let center = hit.position + hit.normal * 0.002;
+            let Some(c) = project_to_hud(center, view_proj, hud_size) else {
+                return;
+            };
+            let ring = circle_on_plane(center, hit.normal, self.brush.radius, SEGMENTS)
+                .into_iter()
+                .filter_map(|p| project_to_hud(p, view_proj, hud_size))
+                .collect::<Vec<_>>();
+            (c, ring)
+        } else {
+            let c = crate::gpu_paint::cursor_to_map_px(
+                screen,
+                viewport,
+                hud_size.x as u32,
+                hud_size.y as u32,
+            );
+            let r = self.brush_radius_px_at(screen, viewport);
+            let ring = (0..SEGMENTS)
+                .map(|i| {
+                    let a = TAU * i as f32 / SEGMENTS as f32;
+                    c + Vec2::new(a.cos(), a.sin()) * r
+                })
+                .collect::<Vec<_>>();
+            (c, ring)
+        };
+
+        if ring_hud.len() >= 2 {
+            self.scene.hud.polyline(&ring_hud, COLOR, true);
+        }
+        self.scene.hud.line(
+            center_hud + Vec2::new(-CROSS, 0.0),
+            center_hud + Vec2::new(CROSS, 0.0),
+            COLOR,
+        );
+        self.scene.hud.line(
+            center_hud + Vec2::new(0.0, -CROSS),
+            center_hud + Vec2::new(0.0, CROSS),
+            COLOR,
+        );
     }
 
     pub fn end_stroke(&mut self) {
@@ -589,7 +706,7 @@ fn bounds_of_nodes(scene: &Scene, nodes: &[Handle<Node>]) -> Option<(Vec3, Vec3)
     any.then_some((min, max))
 }
 
-fn mesh_world_aabb(mesh: &Mesh, world: glam::Mat4) -> (Vec3, Vec3) {
+fn mesh_world_aabb(mesh: &Mesh, world: Mat4) -> (Vec3, Vec3) {
     let mut min = Vec3::splat(f32::MAX);
     let mut max = Vec3::splat(f32::MIN);
     for p in &mesh.positions {
@@ -602,4 +719,36 @@ fn mesh_world_aabb(mesh: &Mesh, world: glam::Mat4) -> (Vec3, Vec3) {
     } else {
         (min, max)
     }
+}
+
+fn project_to_hud(world: Vec3, view_proj: Mat4, hud_size: Vec2) -> Option<Vec2> {
+    let clip = view_proj * world.extend(1.0);
+    if clip.w <= 1e-5 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    if !ndc.x.is_finite() || !ndc.y.is_finite() {
+        return None;
+    }
+    Some(Vec2::new(
+        (ndc.x * 0.5 + 0.5) * hud_size.x,
+        (0.5 - ndc.y * 0.5) * hud_size.y,
+    ))
+}
+
+fn circle_on_plane(center: Vec3, normal: Vec3, radius: f32, segments: u32) -> Vec<Vec3> {
+    let n = normal.normalize_or_zero();
+    if n.length_squared() < 1e-8 || radius <= 0.0 {
+        return Vec::new();
+    }
+    let helper = if n.y.abs() < 0.99 { Vec3::Y } else { Vec3::X };
+    let tangent = n.cross(helper).normalize_or_zero();
+    let bitangent = n.cross(tangent).normalize_or_zero();
+    let segs = segments.max(3);
+    (0..segs)
+        .map(|i| {
+            let a = TAU * i as f32 / segs as f32;
+            center + (tangent * a.cos() + bitangent * a.sin()) * radius
+        })
+        .collect()
 }

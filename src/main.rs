@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use app::{Painter, SCENE_TEX};
 use glam::Vec2;
-use gpu_paint::{cursor_to_map_px, world_radius_to_px, write_paint_rgba, GpuPaint};
+use gpu_paint::{cursor_to_map_px, write_paint_rgba, GpuPaint};
 use mega_render::{Visualizer, WgpuVisualizer};
 use mega_ui::wgpu::UiRenderer;
 use mega_ui::{CursorIcon, Ui, UiInput};
@@ -441,6 +441,19 @@ impl Host {
         self.animating =
             keep_ui || self.looking || self.panning || self.painter.painting || out.needs_repaint;
 
+        // Brush cursor (scene HUD on viewport texture).
+        let vp_rect = self.last_viewport_rect.unwrap_or(mega_ui::Rect {
+            min: Vec2::ZERO,
+            max: Vec2::ZERO,
+        });
+        let show = self.last_viewport_rect.is_some()
+            && !self.looking
+            && !self.panning
+            && !out.want_capture_mouse
+            && vp_rect.contains(mouse_pos);
+        self.painter
+            .update_brush_cursor(mouse_pos, vp_rect, show);
+
         if let Some(text) = out.clipboard {
             if let Some(cb) = self.clipboard.as_mut() {
                 let _ = cb.set_text(text);
@@ -506,14 +519,11 @@ impl Host {
                     .texture_gpu(self.painter.albedo_tex)
                     .cloned();
                 if let Some(paint_tex) = paint_tex {
-                    let radius_px = world_radius_to_px(
-                        self.painter.brush.radius,
-                        self.painter.orbit_dist,
-                        self.painter.scene.camera.fov_y,
-                        vp_h,
-                    );
                     for stamp in &stamps {
                         let center = cursor_to_map_px(stamp.screen, stamp.viewport, vp_w, vp_h);
+                        // Generous screen window: face-on size at hit depth, plus margin for
+                        // grazing angles (world circle elongates on screen).
+                        let screen_r = (stamp.screen_radius_px * 2.0).max(4.0);
                         gpu.gpu_paint.stamp(
                             &gpu.device,
                             &gpu.queue,
@@ -522,7 +532,7 @@ impl Host {
                             (TEX_SIZE, TEX_SIZE),
                             &self.painter.brush,
                             center,
-                            radius_px * 1.25,
+                            screen_r,
                             self.painter.brush.radius,
                         );
                     }

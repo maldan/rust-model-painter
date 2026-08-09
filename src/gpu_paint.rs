@@ -878,11 +878,12 @@ pub fn cursor_to_map_px(screen: Vec2, viewport: Rect, map_w: u32, map_h: u32) ->
     Vec2::new(u * map_w as f32, v * map_h as f32)
 }
 
-pub fn world_radius_to_px(world_r: f32, orbit_dist: f32, fov_y: f32, map_h: u32) -> f32 {
-    let dist = orbit_dist.max(0.2);
+pub fn world_radius_to_px(world_r: f32, distance: f32, fov_y: f32, map_h: u32) -> f32 {
+    // `distance` = camera → surface (not orbit target — that under-sizes close hits).
+    let dist = distance.max(0.05);
     let half = (fov_y * 0.5).tan().max(1e-4);
     let world_h = 2.0 * dist * half;
-    (world_r / world_h * map_h as f32).clamp(2.0, map_h as f32 * 0.5)
+    (world_r / world_h * map_h as f32).clamp(2.0, map_h as f32 * 0.75)
 }
 
 const UV_WGSL: &str = r#"
