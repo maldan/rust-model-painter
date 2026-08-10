@@ -8,7 +8,7 @@ struct Brush {
     color: vec4<f32>,
     channel_mask: vec4<f32>,
     opacity: f32,
-    _pad1: f32,
+    erase: f32,
     map_w: u32,
     map_h: u32,
     tex_w: u32,

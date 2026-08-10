@@ -8,7 +8,7 @@ struct Brush {
     color: vec4<f32>,
     channel_mask: vec4<f32>,
     opacity: f32,
-    _pad1: f32,
+    erase: f32,
     map_w: u32,
     map_h: u32,
     tex_w: u32,
@@ -47,6 +47,13 @@ fn composite(@builtin(global_invocation_id) id: vec3<u32>) {
 
     if (best_a < 0.001) {
         textureStore(paint_dst, tc, src);
+        return;
+    }
+
+    // Eraser: same cover/opacity as paint, but removes layer alpha.
+    if (brush.erase > 0.5) {
+        let out_a = src.a * (1.0 - best_a);
+        textureStore(paint_dst, tc, vec4<f32>(src.rgb, out_a));
         return;
     }
 

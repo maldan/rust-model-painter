@@ -66,6 +66,25 @@ impl Layer {
     }
 }
 
+/// Brush stroke mode — paint deposits color, erase removes layer coverage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PaintTool {
+    #[default]
+    Paint,
+    Eraser,
+}
+
+impl PaintTool {
+    pub const ALL: &'static [PaintTool] = &[PaintTool::Paint, PaintTool::Eraser];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PaintTool::Paint => "Paint",
+            PaintTool::Eraser => "Eraser",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Brush {
     pub color: [f32; 4],

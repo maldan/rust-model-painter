@@ -14,7 +14,7 @@ use gpu_paint::{cursor_to_map_px, write_paint_rgba, GpuPaint};
 use mega_render::{Visualizer, WgpuVisualizer};
 use mega_ui::wgpu::UiRenderer;
 use mega_ui::{CursorIcon, Ui, UiInput};
-use paint::{PaintMap, TEX_SIZE};
+use paint::{PaintMap, PaintTool, TEX_SIZE};
 use pick::find_viewport_rect;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -538,6 +538,7 @@ impl Host {
                 if let Some(layer_h) = self.painter.active_layer_tex() {
                     let paint_tex = gpu.visualizer.texture_gpu(layer_h).cloned();
                     let stamp_brush = self.painter.stamp_brush();
+                    let erase = self.painter.tool == PaintTool::Eraser;
                     if let Some(paint_tex) = paint_tex {
                         for stamp in &stamps {
                             let center = cursor_to_map_px(stamp.screen, stamp.viewport, vp_w, vp_h);
@@ -550,6 +551,7 @@ impl Host {
                                 (TEX_SIZE, TEX_SIZE),
                                 &stamp_brush,
                                 [1.0, 1.0, 1.0, 1.0],
+                                erase,
                                 center,
                                 screen_r,
                                 stamp_brush.radius,

@@ -63,7 +63,8 @@ struct BrushUniforms {
     /// Per-channel write mask (always 1s when stamping into a layer).
     channel_mask: [f32; 4],
     opacity: f32,
-    _pad1: f32,
+    /// 0 = paint over, 1 = erase layer alpha.
+    erase: f32,
     map_w: u32,
     map_h: u32,
     tex_w: u32,
@@ -668,6 +669,7 @@ impl GpuPaint {
         paint_size: (u32, u32),
         brush: &Brush,
         channel_mask: [f32; 4],
+        erase: bool,
         center_px: Vec2,
         screen_radius_px: f32,
         world_radius: f32,
@@ -751,7 +753,7 @@ impl GpuPaint {
             color: brush.color,
             channel_mask,
             opacity: brush.opacity.clamp(0.0, 1.0),
-            _pad1: 0.0,
+            erase: if erase { 1.0 } else { 0.0 },
             map_w: mw,
             map_h: mh,
             tex_w: tw,

@@ -10,7 +10,7 @@ use mega_render::{
 };
 use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
 
-use crate::paint::{Brush, PaintDocument, PaintMap, TEX_SIZE};
+use crate::paint::{Brush, PaintDocument, PaintMap, PaintTool, TEX_SIZE};
 use crate::pick::{self, BvhCache};
 use crate::post_ui;
 use mega_ui::Rect;
@@ -38,6 +38,7 @@ pub struct Painter {
     pub paint_map: PaintMap,
     pub debug_view: DebugView,
     pub brush: Brush,
+    pub tool: PaintTool,
     pub albedo_tex: Handle<Texture>,
     pub mr_tex: Handle<Texture>,
     pub paintable: Vec<Handle<Node>>,
@@ -165,6 +166,7 @@ impl Painter {
             paint_map: PaintMap::Albedo,
             debug_view: DebugView::Final,
             brush: Brush::default(),
+            tool: PaintTool::Paint,
             albedo_tex,
             mr_tex,
             paintable: vec![sphere_node],
@@ -553,7 +555,10 @@ impl Painter {
     }
 
     fn draw_brush_cursor(&mut self, screen: Vec2, viewport: Rect, hud_size: Vec2) {
-        const COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.92];
+        let color = match self.tool {
+            PaintTool::Paint => [1.0, 1.0, 1.0, 0.92],
+            PaintTool::Eraser => [0.55, 0.75, 1.0, 0.92],
+        };
         const SEGMENTS: u32 = 48;
         const CROSS: f32 = 4.0;
 
@@ -602,17 +607,17 @@ impl Painter {
         };
 
         if ring_hud.len() >= 2 {
-            self.scene.hud.polyline(&ring_hud, COLOR, true);
+            self.scene.hud.polyline(&ring_hud, color, true);
         }
         self.scene.hud.line(
             center_hud + Vec2::new(-CROSS, 0.0),
             center_hud + Vec2::new(CROSS, 0.0),
-            COLOR,
+            color,
         );
         self.scene.hud.line(
             center_hud + Vec2::new(0.0, -CROSS),
             center_hud + Vec2::new(0.0, CROSS),
-            COLOR,
+            color,
         );
     }
 
@@ -651,6 +656,7 @@ impl Painter {
         let mut open_model = false;
         let mut paint_map = self.paint_map;
         let mut debug_view = self.debug_view;
+        let mut tool = self.tool;
         let has_model = self.model_root.is_some();
 
         {
@@ -664,8 +670,14 @@ impl Painter {
 
             ui.dock_space("main", dock_size, dock, |ui, tab| match tab {
                 "Viewport" => {
+                    let tool_hint = match tool {
+                        PaintTool::Paint => "paint",
+                        PaintTool::Eraser => "erase",
+                    };
                     ui.label_styled(
-                        &format!("LMB paint · MMB pan · RMB orbit · wheel zoom · {fps:.0} fps"),
+                        &format!(
+                            "LMB {tool_hint} · MMB pan · RMB orbit · wheel zoom · {fps:.0} fps"
+                        ),
                         TextStyle {
                             color: [0.7, 0.7, 0.72, 1.0],
                             size: 13.0,
@@ -693,8 +705,22 @@ impl Painter {
                 "Brush" => {
                     ui.label("Brush");
                     ui.separator();
-                    ui.label("Color — stamp tint (MR maps use luminance)");
-                    ui.color_edit("color", &mut brush.color);
+                    ui.label("Tool");
+                    let mut tool_idx = PaintTool::ALL
+                        .iter()
+                        .position(|t| *t == tool)
+                        .unwrap_or(0);
+                    let tool_labels: Vec<&str> =
+                        PaintTool::ALL.iter().map(|t| t.label()).collect();
+                    if ui.toggle("paint_tool", &mut tool_idx, &tool_labels).changed() {
+                        tool = PaintTool::ALL[tool_idx];
+                        keep = true;
+                    }
+                    ui.separator();
+                    if tool == PaintTool::Paint {
+                        ui.label("Color — stamp tint (MR maps use luminance)");
+                        ui.color_edit("color", &mut brush.color);
+                    }
                     ui.label("Radius — world-space stamp size");
                     ui.slider("radius", &mut brush.radius, 0.01..=0.35);
                     ui.label("Hardness — 0 soft falloff · 1 hard edge");
@@ -880,6 +906,7 @@ impl Painter {
             active = self.doc().active;
         }
         self.debug_view = debug_view;
+        self.tool = tool;
 
         if open_model {
             self.open_model_dialog();
