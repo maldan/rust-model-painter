@@ -827,29 +827,43 @@ impl Painter {
                         for i in (0..layers.len()).rev() {
                             let is_active = i == active;
                             let name = layers[i].name.clone();
-                            ui.group(&name, |ui| {
-                                let label = if is_active { "> active" } else { "Select" };
-                                ui.row(|ui| {
-                                    if ui.button(label).clicked() {
-                                        active = i;
-                                    }
+                            if ui
+                                .selectable(&format!("layer{i}"), is_active, |ui| {
+                                    ui.row(|ui| {
+                                        let eye = if layers[i].visible {
+                                            "visibility"
+                                        } else {
+                                            "visibility_off"
+                                        };
+                                        if ui.icon_button(
+                                            &format!("vis{i}"),
+                                            eye,
+                                            layers[i].visible,
+                                        ) {
+                                            layers[i].visible = !layers[i].visible;
+                                            dirty_layers = true;
+                                            keep = true;
+                                        }
+                                        ui.label(&name);
+                                    });
+                                    ui.label("Opacity");
                                     if ui
-                                        .checkbox(&format!("vis{i}"), &mut layers[i].visible)
+                                        .slider(
+                                            &format!("op{i}"),
+                                            &mut layers[i].opacity,
+                                            0.0..=1.0,
+                                        )
                                         .changed()
                                     {
                                         dirty_layers = true;
                                         keep = true;
                                     }
-                                });
-                                ui.label("Opacity");
-                                if ui
-                                    .slider(&format!("op{i}"), &mut layers[i].opacity, 0.0..=1.0)
-                                    .changed()
-                                {
-                                    dirty_layers = true;
-                                    keep = true;
-                                }
-                            });
+                                })
+                                .clicked()
+                            {
+                                active = i;
+                                keep = true;
+                            }
                         }
                     });
                 }
