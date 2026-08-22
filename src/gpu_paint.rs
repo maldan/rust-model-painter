@@ -1064,7 +1064,11 @@ fn upload_paint_mesh(device: &wgpu::Device, mesh: &Mesh) -> PaintMesh {
         .map(|(i, p)| UvVertex {
             pos: *p,
             normal: mesh.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
-            uv: mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+            uv: mesh
+                .uvs
+                .first()
+                .and_then(|c| c.get(i).copied())
+                .unwrap_or([0.0, 0.0]),
         })
         .collect();
     PaintMesh {

@@ -80,6 +80,7 @@ struct FrameInput {
     scroll_delta: Vec2,
     text: String,
     key_backspace: bool,
+    key_delete: bool,
     key_enter: bool,
     key_left: bool,
     key_right: bool,
@@ -93,6 +94,7 @@ struct FrameInput {
     key_paste: bool,
     key_cut: bool,
     key_select_all: bool,
+    key_duplicate: bool,
     modifiers: winit::keyboard::ModifiersState,
     clipboard_paste: String,
     look_delta: Vec2,
@@ -110,6 +112,7 @@ impl FrameInput {
         self.look_delta = Vec2::ZERO;
         self.text.clear();
         self.key_backspace = false;
+        self.key_delete = false;
         self.key_enter = false;
         self.key_left = false;
         self.key_right = false;
@@ -121,6 +124,7 @@ impl FrameInput {
         self.key_paste = false;
         self.key_cut = false;
         self.key_select_all = false;
+        self.key_duplicate = false;
         self.clipboard_paste.clear();
     }
 
@@ -133,11 +137,15 @@ impl FrameInput {
             mouse_right_down: self.mouse_right_down,
             mouse_right_pressed: self.mouse_right_pressed,
             mouse_right_released: self.mouse_right_released,
+            mouse_middle_down: self.mouse_middle_down,
+            mouse_middle_pressed: self.mouse_middle_pressed,
+            mouse_middle_released: self.mouse_middle_released,
             viewport,
             scroll_delta: self.scroll_delta,
             dt,
             text: self.text.clone(),
             key_backspace: self.key_backspace,
+            key_delete: self.key_delete,
             key_enter: self.key_enter,
             key_left: self.key_left,
             key_right: self.key_right,
@@ -151,6 +159,7 @@ impl FrameInput {
             key_paste: self.key_paste,
             key_cut: self.key_cut,
             key_select_all: self.key_select_all,
+            key_duplicate: self.key_duplicate,
             clipboard: self.clipboard_paste.clone(),
         }
     }
@@ -868,6 +877,7 @@ impl ApplicationHandler for Host {
                 }
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::Backspace) => self.input.key_backspace = down,
+                    PhysicalKey::Code(KeyCode::Delete) => self.input.key_delete = down,
                     PhysicalKey::Code(KeyCode::Enter) => self.input.key_enter = down,
                     PhysicalKey::Code(KeyCode::ArrowLeft) => self.input.key_left = down,
                     PhysicalKey::Code(KeyCode::ArrowRight) => self.input.key_right = down,
@@ -894,6 +904,11 @@ impl ApplicationHandler for Host {
                         if down && (self.input.modifiers.control_key() || self.input.modifiers.super_key()) =>
                     {
                         self.input.key_select_all = true;
+                    }
+                    PhysicalKey::Code(KeyCode::KeyD)
+                        if down && (self.input.modifiers.control_key() || self.input.modifiers.super_key()) =>
+                    {
+                        self.input.key_duplicate = true;
                     }
                     _ => {}
                 }

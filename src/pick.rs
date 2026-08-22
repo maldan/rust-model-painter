@@ -132,9 +132,10 @@ fn ray_mesh_uv(
         (best_t, i0, i1, i2, p0, p1, p2, u, v)
     };
 
-    let uv0 = Vec2::from_array(mesh.uvs.get(i0).copied().unwrap_or([0.0, 0.0]));
-    let uv1 = Vec2::from_array(mesh.uvs.get(i1).copied().unwrap_or([0.0, 0.0]));
-    let uv2 = Vec2::from_array(mesh.uvs.get(i2).copied().unwrap_or([0.0, 0.0]));
+    let uv_ch = mesh.uvs.first();
+    let uv0 = Vec2::from_array(uv_ch.and_then(|c| c.get(i0).copied()).unwrap_or([0.0, 0.0]));
+    let uv1 = Vec2::from_array(uv_ch.and_then(|c| c.get(i1).copied()).unwrap_or([0.0, 0.0]));
+    let uv2 = Vec2::from_array(uv_ch.and_then(|c| c.get(i2).copied()).unwrap_or([0.0, 0.0]));
     let uv = uv0 + (uv1 - uv0) * u + (uv2 - uv0) * v;
 
     let n0 = Vec3::from_array(mesh.normals.get(i0).copied().unwrap_or([0.0, 1.0, 0.0]));
