@@ -10,7 +10,12 @@ use mega_render::{
 };
 use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
 
-use crate::paint::{Brush, PaintDocument, PaintMap, PaintTool, TEX_SIZE};
+use crate::brush_alpha::{
+    generate_normal_stamps, generate_presets, BrushAlpha, NormalStamp, ALPHA_TEX_BASE, NRM_TEX_BASE,
+};
+use crate::paint::{
+    luma, Brush, LayerKind, PaintDocument, PaintMap, PaintTarget, PaintTool, FLAT_NORMAL, TEX_SIZE,
+};
 use crate::pick::{self, BvhCache};
 use crate::post_ui;
 use mega_ui::Rect;
@@ -22,6 +27,7 @@ const VIEW_MODES: &[DebugView] = &[
     DebugView::Albedo,
     DebugView::Metallic,
     DebugView::Roughness,
+    DebugView::Normals,
 ];
 
 #[derive(Clone, Copy)]
@@ -30,17 +36,23 @@ pub struct PendingStamp {
     pub viewport: Rect,
     /// Screen-space search radius at stamp depth (viewport pixels).
     pub screen_radius_px: f32,
+    pub plane_normal: Vec3,
 }
 
 pub struct Painter {
     pub scene: Scene,
-    pub docs: [PaintDocument; 3],
+    pub docs: [PaintDocument; 4],
     pub paint_map: PaintMap,
     pub debug_view: DebugView,
     pub brush: Brush,
     pub tool: PaintTool,
+    pub alphas: Vec<BrushAlpha>,
+    pub active_alpha: usize,
+    pub nrm_stamps: Vec<NormalStamp>,
+    pub active_nrm: usize,
     pub albedo_tex: Handle<Texture>,
     pub mr_tex: Handle<Texture>,
+    pub nrm_tex: Handle<Texture>,
     pub paintable: Vec<Handle<Node>>,
     pub dock: DockState,
     pub viewport_size: Vec2,
@@ -82,6 +94,7 @@ impl Painter {
             PaintDocument::new(TEX_SIZE, TEX_SIZE, [220.0 / 255.0, 220.0 / 255.0, 225.0 / 255.0, 1.0]),
             PaintDocument::new(TEX_SIZE, TEX_SIZE, [0.0, 0.0, 0.0, 1.0]),
             PaintDocument::new(TEX_SIZE, TEX_SIZE, [0.0, rough, 0.0, 1.0]),
+            PaintDocument::new(TEX_SIZE, TEX_SIZE, FLAT_NORMAL),
         ];
 
         // Material composite targets (filled by GPU layer composite).
@@ -99,18 +112,23 @@ impl Painter {
         }
         let mr_tex = scene.textures.insert(mr);
 
+        let mut nrm = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false);
+        fill_rgba(&mut nrm.rgba, 128, 128, 255, 255);
+        let nrm_tex = scene.textures.insert(nrm);
+
         // Seed each stack with one empty GPU layer.
         for doc in &mut docs {
             let tex = scene
                 .textures
                 .insert(Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false));
-            doc.layers.push(crate::paint::Layer::new("Layer 1", tex));
+            doc.layers.push(crate::paint::Layer::paint("Layer 1", tex));
             doc.active = 0;
             doc.mark_dirty();
         }
 
         let mut paint_mat_data = Material::new([1.0, 1.0, 1.0, 1.0], 1.0, 1.0).with_map(albedo_tex);
         paint_mat_data.metallic_roughness_map = Some(mr_tex);
+        paint_mat_data.normal_map = Some(nrm_tex);
         let paint_mat = scene.materials.insert(paint_mat_data);
         let ground_mat = scene
             .materials
@@ -167,16 +185,25 @@ impl Painter {
             debug_view: DebugView::Final,
             brush: Brush::default(),
             tool: PaintTool::Paint,
+            alphas: generate_presets(),
+            active_alpha: 0,
+            nrm_stamps: generate_normal_stamps(),
+            active_nrm: 0,
             albedo_tex,
             mr_tex,
+            nrm_tex,
             paintable: vec![sphere_node],
             dock: DockState::new(DockNode::split_h(
-                0.72,
-                DockNode::leaf(&["Viewport"]),
-                DockNode::split_v(
-                    0.55,
-                    DockNode::leaf(&["Brush", "Lights", "Effects"]),
-                    DockNode::leaf(&["Layers"]),
+                0.15,
+                DockNode::leaf(&["Alphas"]),
+                DockNode::split_h(
+                    0.72,
+                    DockNode::leaf(&["Viewport"]),
+                    DockNode::split_v(
+                        0.55,
+                        DockNode::leaf(&["Brush", "Lights", "Effects"]),
+                        DockNode::leaf(&["Layers"]),
+                    ),
                 ),
             )),
             viewport_size: Vec2::new(1280.0, 720.0),
@@ -216,18 +243,39 @@ impl Painter {
         &mut self.docs[self.paint_map.index()]
     }
 
-    pub fn active_layer_tex(&self) -> Option<Handle<Texture>> {
+    pub fn stamp_target_tex(&self) -> Option<Handle<Texture>> {
         let doc = self.doc();
-        doc.layers.get(doc.active).map(|l| l.tex)
+        let layer = doc.layers.get(doc.active)?;
+        // Fill has no pixels — the brush always writes the mask.
+        if layer.kind == LayerKind::Fill || doc.paint_target == PaintTarget::Mask {
+            layer.mask
+        } else {
+            layer.tex
+        }
     }
 
-    /// Grayscale brush color for metallic / roughness stamps.
+    pub fn painting_mask(&self) -> bool {
+        let Some(layer) = self.doc().active_layer() else {
+            return false;
+        };
+        (layer.kind == LayerKind::Fill || self.doc().paint_target == PaintTarget::Mask)
+            && layer.mask.is_some()
+    }
+
+    /// Brush color for the current stamp target (layer pixels or mask).
     pub fn stamp_brush(&self) -> Brush {
+        if self.painting_mask() {
+            let v = luma(self.brush.color);
+            return Brush {
+                color: [v, v, v, 1.0],
+                ..self.brush
+            };
+        }
         match self.paint_map {
             PaintMap::Albedo => self.brush,
+            PaintMap::Normal => self.brush,
             PaintMap::Metallic | PaintMap::Roughness => {
-                let c = self.brush.color;
-                let v = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+                let v = luma(self.brush.color);
                 Brush {
                     color: [v, v, v, 1.0],
                     ..self.brush
@@ -249,36 +297,153 @@ impl Painter {
         };
         let tex = self.alloc_layer_tex();
         let doc = self.doc_mut();
-        doc.layers.push(crate::paint::Layer::new(name, tex));
+        doc.layers.push(crate::paint::Layer::paint(name, tex));
         doc.active = doc.layers.len() - 1;
+        doc.paint_target = PaintTarget::Content;
         doc.mark_dirty();
     }
 
+    pub fn add_fill_layer(&mut self) {
+        let color = match self.paint_map {
+            PaintMap::Albedo => self.brush.color,
+            PaintMap::Normal => FLAT_NORMAL,
+            PaintMap::Metallic | PaintMap::Roughness => {
+                let v = luma(self.brush.color);
+                [v, v, v, 1.0]
+            }
+        };
+        let n = self
+            .doc()
+            .layers
+            .iter()
+            .filter(|l| l.kind == LayerKind::Fill)
+            .count()
+            + 1;
+        let doc = self.doc_mut();
+        doc.layers
+            .push(crate::paint::Layer::fill(format!("Fill {n}"), color));
+        doc.active = doc.layers.len() - 1;
+        doc.paint_target = PaintTarget::Content;
+        doc.mark_dirty();
+    }
+
+    fn add_mask_to(&mut self, i: usize) {
+        if self
+            .doc()
+            .layers
+            .get(i)
+            .is_some_and(|l| l.mask.is_some())
+        {
+            let doc = self.doc_mut();
+            doc.active = i;
+            doc.paint_target = PaintTarget::Mask;
+            return;
+        }
+        let tex = self.alloc_layer_tex();
+        let doc = self.doc_mut();
+        let Some(layer) = doc.layers.get_mut(i) else {
+            self.scene.textures.remove(tex);
+            return;
+        };
+        let hide = layer.kind == LayerKind::Fill;
+        layer.mask = Some(tex);
+        // Fill: black (paint to reveal). Paint: white (keep existing strokes).
+        layer.mask_init = Some(if hide {
+            [0, 0, 0, 255]
+        } else {
+            [255, 255, 255, 255]
+        });
+        doc.active = i;
+        doc.paint_target = PaintTarget::Mask;
+        doc.mark_dirty();
+    }
+
+    fn toggle_mask_target(&mut self, i: usize) {
+        if i >= self.doc().layers.len() {
+            return;
+        }
+        let has_mask = self.doc().layers[i].mask.is_some();
+        if !has_mask {
+            self.add_mask_to(i);
+            return;
+        }
+        let doc = self.doc_mut();
+        if doc.active == i && doc.paint_target == PaintTarget::Mask {
+            doc.paint_target = PaintTarget::Content;
+        } else {
+            doc.active = i;
+            doc.paint_target = PaintTarget::Mask;
+        }
+    }
+
+    fn remove_mask_from_active(&mut self) {
+        let active = self.doc().active;
+        let tex = {
+            let doc = self.doc_mut();
+            let Some(layer) = doc.layers.get_mut(active) else {
+                return;
+            };
+            let tex = layer.mask.take();
+            layer.mask_init = None;
+            doc.paint_target = PaintTarget::Content;
+            doc.mark_dirty();
+            tex
+        };
+        if let Some(tex) = tex {
+            self.scene.textures.remove(tex);
+        }
+    }
+
     pub fn remove_active_layer(&mut self) {
+        let targeting_mask = self.doc().paint_target == PaintTarget::Mask
+            && self
+                .doc()
+                .active_layer()
+                .is_some_and(|l| l.mask.is_some());
+        if targeting_mask {
+            self.remove_mask_from_active();
+            return;
+        }
         let active = self.doc().active;
         if self.doc().layers.len() <= 1 {
             let doc = self.doc_mut();
             if let Some(l) = doc.layers.get_mut(0) {
-                l.needs_clear = true;
+                if l.kind == LayerKind::Paint {
+                    l.needs_clear = true;
+                }
             }
+            doc.paint_target = PaintTarget::Content;
             doc.mark_dirty();
             return;
         }
-        let tex = {
+        let handles: Vec<_> = {
             let doc = self.doc_mut();
             let layer = doc.layers.remove(active);
             doc.active = active.min(doc.layers.len() - 1);
+            doc.paint_target = PaintTarget::Content;
+            doc.clamp_paint_target();
             doc.mark_dirty();
-            layer.tex
+            layer.gpu_handles().collect()
         };
-        self.scene.textures.remove(tex);
+        for tex in handles {
+            self.scene.textures.remove(tex);
+        }
     }
 
     pub fn clear_active_layer(&mut self) {
-        let active = self.doc().active;
+        let targeting_mask = self.doc().paint_target == PaintTarget::Mask;
         let doc = self.doc_mut();
+        let active = doc.active;
         if let Some(l) = doc.layers.get_mut(active) {
-            l.needs_clear = true;
+            if targeting_mask && l.mask.is_some() {
+                l.mask_init = Some(if l.kind == LayerKind::Fill {
+                    [0, 0, 0, 255]
+                } else {
+                    [255, 255, 255, 255]
+                });
+            } else if l.kind == LayerKind::Paint {
+                l.needs_clear = true;
+            }
         }
         doc.mark_dirty();
     }
@@ -395,6 +560,7 @@ impl Painter {
                 mat.metallic = 1.0;
                 mat.roughness = 1.0;
                 mat.metallic_roughness_map = Some(self.mr_tex);
+                mat.normal_map = Some(self.nrm_tex);
             }
         }
 
@@ -408,7 +574,7 @@ impl Painter {
         let mut old = Vec::new();
         for doc in &mut self.docs {
             for layer in doc.layers.drain(..) {
-                old.push(layer.tex);
+                old.extend(layer.gpu_handles());
             }
         }
         for tex in old {
@@ -425,15 +591,16 @@ impl Painter {
             ),
             PaintDocument::new(TEX_SIZE, TEX_SIZE, [0.0, 0.0, 0.0, 1.0]),
             PaintDocument::new(TEX_SIZE, TEX_SIZE, [0.0, rough, 0.0, 1.0]),
+            PaintDocument::new(TEX_SIZE, TEX_SIZE, FLAT_NORMAL),
         ];
-        for i in 0..3 {
+        for i in 0..self.docs.len() {
             let tex = self
                 .scene
                 .textures
                 .insert(Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false));
             self.docs[i]
                 .layers
-                .push(crate::paint::Layer::new("Layer 1", tex));
+                .push(crate::paint::Layer::paint("Layer 1", tex));
             self.docs[i].active = 0;
             self.docs[i].mark_dirty();
         }
@@ -450,16 +617,28 @@ impl Painter {
                 px[3] = 255;
             }
         }
+        if let Some(tex) = self.scene.textures.get_mut(self.nrm_tex) {
+            fill_rgba(&mut tex.rgba, 128, 128, 255, 255);
+        }
         self.needs_map_seed = true;
     }
 
     /// Upload albedo/MR CPU bases into GPU (call after visualizer.sync).
-    pub fn seed_map_pixels(&self, queue: &wgpu::Queue, albedo: &wgpu::Texture, mr: &wgpu::Texture) {
+    pub fn seed_map_pixels(
+        &self,
+        queue: &wgpu::Queue,
+        albedo: &wgpu::Texture,
+        mr: &wgpu::Texture,
+        nrm: &wgpu::Texture,
+    ) {
         if let Some(cpu) = self.scene.textures.get(self.albedo_tex) {
             crate::gpu_paint::write_paint_rgba(queue, albedo, &cpu.rgba, cpu.width, cpu.height);
         }
         if let Some(cpu) = self.scene.textures.get(self.mr_tex) {
             crate::gpu_paint::write_paint_rgba(queue, mr, &cpu.rgba, cpu.width, cpu.height);
+        }
+        if let Some(cpu) = self.scene.textures.get(self.nrm_tex) {
+            crate::gpu_paint::write_paint_rgba(queue, nrm, &cpu.rgba, cpu.width, cpu.height);
         }
     }
 
@@ -483,6 +662,17 @@ impl Painter {
     }
 
     pub fn paint_at(&mut self, screen: Vec2, viewport: mega_ui::Rect) {
+        if self
+            .doc()
+            .active_layer()
+            .is_some_and(|l| l.kind == LayerKind::Fill && l.mask.is_none())
+        {
+            let i = self.doc().active;
+            self.add_mask_to(i);
+        }
+        if self.stamp_target_tex().is_none() {
+            return;
+        }
         let local = Vec2::new(
             (screen.x - viewport.min.x).clamp(0.0, viewport.width().max(1.0)),
             (screen.y - viewport.min.y).clamp(0.0, viewport.height().max(1.0)),
@@ -494,10 +684,15 @@ impl Painter {
             }
         }
         self.last_stamp_px = Some(local);
+        let plane_normal = self
+            .pick_hit(screen, viewport)
+            .map(|h| h.normal)
+            .unwrap_or(Vec3::Y);
         self.pending_stamps.push(PendingStamp {
             screen,
             viewport,
             screen_radius_px: radius_px,
+            plane_normal,
         });
         self.doc_mut().mark_dirty();
     }
@@ -517,19 +712,23 @@ impl Painter {
     }
 
     fn pick_distance(&mut self, screen: Vec2, viewport: Rect) -> Option<f32> {
+        let hit = self.pick_hit(screen, viewport)?;
+        Some(hit.position.distance(self.scene.camera.eye).max(0.05))
+    }
+
+    fn pick_hit(&mut self, screen: Vec2, viewport: Rect) -> Option<pick::Hit> {
         let aspect = (self.viewport_size.x / self.viewport_size.y.max(1.0)).max(1e-4);
         let view_proj = self.scene.camera.view_proj(aspect);
         let (origin, dir) =
             pick::screen_ray(screen, viewport, self.scene.camera.eye, view_proj.inverse());
         pick::ensure_bvhs(&self.scene, &self.paintable, &mut self.bvh_cache);
-        let hit = pick::pick_mesh(
+        pick::pick_mesh(
             &self.scene,
             origin,
             dir,
             &self.paintable,
             &self.bvh_cache,
-        )?;
-        Some(hit.position.distance(self.scene.camera.eye).max(0.05))
+        )
     }
 
     /// Brush cursor into `scene.hud` (viewport pixel space, drawn with the scene).
@@ -647,16 +846,23 @@ impl Painter {
         let mut keep = false;
         let mut shape = self.shape;
         let mut add_layer = false;
+        let mut add_fill = false;
         let mut del_layer = false;
         let mut clear_layer = false;
         let mut move_up = false;
         let mut move_down = false;
         let mut active = self.doc().active;
+        let mut mask_click: Option<usize> = None;
+        let mut content_click: Option<usize> = None;
         let mut dirty_layers = false;
         let mut open_model = false;
         let mut paint_map = self.paint_map;
         let mut debug_view = self.debug_view;
         let mut tool = self.tool;
+        let mut active_alpha = self.active_alpha;
+        let mut active_nrm = self.active_nrm;
+        let alpha_names: Vec<&'static str> = self.alphas.iter().map(|a| a.name).collect();
+        let nrm_names: Vec<&'static str> = self.nrm_stamps.iter().map(|a| a.name).collect();
         let has_model = self.model_root.is_some();
 
         {
@@ -669,10 +875,73 @@ impl Painter {
             let scene = &mut self.scene;
 
             ui.dock_space("main", dock_size, dock, |ui, tab| match tab {
+                "Alphas" => {
+                    let nrm_panel = paint_map == PaintMap::Normal
+                        && docs[paint_map.index()].paint_target != PaintTarget::Mask;
+                    ui.label(if nrm_panel { "Normals" } else { "Alphas" });
+                    ui.separator();
+                    let size = ui.available_size();
+                    if nrm_panel {
+                        ui.scroll_area("nrm_stamps", size, ScrollAxes::Vertical, |ui| {
+                            ui.grid(2, |ui| {
+                                for i in 0..nrm_names.len() {
+                                    ui.grid_cell(|ui| {
+                                        if ui
+                                            .selectable(
+                                                &format!("nrm{i}"),
+                                                i == active_nrm,
+                                                |ui| {
+                                                    let w = ui.available_size().x.max(24.0);
+                                                    ui.texture(
+                                                        NRM_TEX_BASE + i as u32,
+                                                        Vec2::new(w, w),
+                                                    );
+                                                    ui.label(nrm_names[i]);
+                                                },
+                                            )
+                                            .clicked()
+                                        {
+                                            active_nrm = i;
+                                            keep = true;
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                    } else {
+                        ui.scroll_area("alphas", size, ScrollAxes::Vertical, |ui| {
+                            ui.grid(2, |ui| {
+                                for i in 0..alpha_names.len() {
+                                    ui.grid_cell(|ui| {
+                                        if ui
+                                            .selectable(
+                                                &format!("alpha{i}"),
+                                                i == active_alpha,
+                                                |ui| {
+                                                    let w = ui.available_size().x.max(24.0);
+                                                    ui.texture(
+                                                        ALPHA_TEX_BASE + i as u32,
+                                                        Vec2::new(w, w),
+                                                    );
+                                                    ui.label(alpha_names[i]);
+                                                },
+                                            )
+                                            .clicked()
+                                        {
+                                            active_alpha = i;
+                                            keep = true;
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                    }
+                }
                 "Viewport" => {
-                    let tool_hint = match tool {
-                        PaintTool::Paint => "paint",
-                        PaintTool::Eraser => "erase",
+                    let tool_hint = match (tool, docs[paint_map.index()].paint_target) {
+                        (_, PaintTarget::Mask) => "paint mask",
+                        (PaintTool::Paint, _) => "paint",
+                        (PaintTool::Eraser, _) => "erase",
                     };
                     ui.label_styled(
                         &format!(
@@ -717,8 +986,49 @@ impl Painter {
                         keep = true;
                     }
                     ui.separator();
-                    if tool == PaintTool::Paint {
+                    let targeting_mask =
+                        docs[paint_map.index()].paint_target == PaintTarget::Mask;
+                    let fill_content = docs[paint_map.index()]
+                        .layers
+                        .get(active)
+                        .is_some_and(|l| l.kind == LayerKind::Fill);
+                    if fill_content {
+                        if paint_map == PaintMap::Albedo {
+                            ui.label("Fill color");
+                            if let Some(layer) =
+                                docs[paint_map.index()].layers.get_mut(active)
+                            {
+                                if ui.color_edit("fill_color", &mut layer.fill).changed() {
+                                    dirty_layers = true;
+                                    keep = true;
+                                }
+                            }
+                        } else if paint_map == PaintMap::Normal {
+                            ui.label("Fill — flat normal (128, 128, 255)");
+                        } else if let Some(layer) =
+                            docs[paint_map.index()].layers.get_mut(active)
+                        {
+                            ui.label("Fill value");
+                            let mut v = luma(layer.fill);
+                            if ui.slider("fill_value", &mut v, 0.0..=1.0).changed() {
+                                layer.fill = [v, v, v, 1.0];
+                                dirty_layers = true;
+                                keep = true;
+                            }
+                        }
+                    }
+                    if targeting_mask {
+                        ui.label("Brush — luminance on mask (white pass, black block)");
+                    } else if paint_map == PaintMap::Normal {
+                        ui.label("Normal stamp — pick from the left panel");
+                    } else if fill_content {
+                        ui.label("Brush — luminance on mask (white pass, black block)");
+                    } else {
                         ui.label("Color — stamp tint (MR maps use luminance)");
+                    }
+                    if paint_map != PaintMap::Normal
+                        && (tool == PaintTool::Paint || targeting_mask || fill_content)
+                    {
                         ui.color_edit("color", &mut brush.color);
                     }
                     ui.label("Radius — world-space stamp size");
@@ -813,6 +1123,9 @@ impl Painter {
                         {
                             add_layer = true;
                         }
+                        if ui.button("Fill").clicked() {
+                            add_fill = true;
+                        }
                         if ui
                             .button_with("del_layer", |ui| {
                                 ui.icon("delete", 14.0);
@@ -846,13 +1159,19 @@ impl Painter {
                             move_down = true;
                         }
                     });
+                    ui.label("Pencil = mask · fill paints mask (white reveals)");
                     ui.separator();
+                    let paint_target = docs[paint_map.index()].paint_target;
                     let layers = &mut docs[paint_map.index()].layers;
                     let size = ui.available_size();
                     ui.scroll_area("layers", size, ScrollAxes::Vertical, |ui| {
                         for i in (0..layers.len()).rev() {
                             let is_active = i == active;
                             let name = layers[i].name.clone();
+                            let kind = layers[i].kind;
+                            let has_mask = layers[i].mask.is_some();
+                            let mask_selected =
+                                is_active && paint_target == PaintTarget::Mask && has_mask;
                             if ui
                                 .selectable(&format!("layer{i}"), is_active, |ui| {
                                     ui.row(|ui| {
@@ -871,7 +1190,46 @@ impl Painter {
                                             keep = true;
                                         }
                                         ui.label(&name);
+                                        if ui.icon_button(
+                                            &format!("mask{i}"),
+                                            "edit",
+                                            mask_selected,
+                                        ) {
+                                            mask_click = Some(i);
+                                            keep = true;
+                                        }
                                     });
+                                    if kind == LayerKind::Fill {
+                                        ui.label("Fill");
+                                        if paint_map == PaintMap::Albedo {
+                                            if ui
+                                                .color_edit(
+                                                    &format!("fill{i}"),
+                                                    &mut layers[i].fill,
+                                                )
+                                                .changed()
+                                            {
+                                                dirty_layers = true;
+                                                keep = true;
+                                            }
+                                        } else if paint_map == PaintMap::Normal {
+                                            ui.label("Flat nrm");
+                                        } else {
+                                            let mut v = luma(layers[i].fill);
+                                            if ui
+                                                .slider(
+                                                    &format!("fillv{i}"),
+                                                    &mut v,
+                                                    0.0..=1.0,
+                                                )
+                                                .changed()
+                                            {
+                                                layers[i].fill = [v, v, v, 1.0];
+                                                dirty_layers = true;
+                                                keep = true;
+                                            }
+                                        }
+                                    }
                                     ui.label("Opacity");
                                     if ui
                                         .slider(
@@ -888,6 +1246,7 @@ impl Painter {
                                 .clicked()
                             {
                                 active = i;
+                                content_click = Some(i);
                                 keep = true;
                             }
                         }
@@ -903,10 +1262,11 @@ impl Painter {
 
         if paint_map != self.paint_map {
             self.paint_map = paint_map;
-            active = self.doc().active;
         }
         self.debug_view = debug_view;
         self.tool = tool;
+        self.active_alpha = active_alpha;
+        self.active_nrm = active_nrm;
 
         if open_model {
             self.open_model_dialog();
@@ -914,14 +1274,23 @@ impl Painter {
         } else if shape != self.shape {
             self.set_shape(shape);
         }
-        if active != self.doc().active && active < self.doc().layers.len() {
-            self.doc_mut().active = active;
+        if let Some(i) = mask_click {
+            self.toggle_mask_target(i);
+        } else if let Some(i) = content_click {
+            if i < self.doc().layers.len() {
+                let doc = self.doc_mut();
+                doc.active = i;
+                doc.paint_target = PaintTarget::Content;
+            }
         }
         if dirty_layers {
             self.doc_mut().mark_dirty();
         }
         if add_layer {
             self.add_layer();
+        }
+        if add_fill {
+            self.add_fill_layer();
         }
         if del_layer {
             self.remove_active_layer();

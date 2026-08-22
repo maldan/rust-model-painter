@@ -1,7 +1,9 @@
 use mega_render::Handle;
 use mega_render::Texture;
 
-pub const TEX_SIZE: u32 = 1024;
+pub const TEX_SIZE: u32 = 2048;
+/// Packed tangent-space flat normal (OpenGL / glTF): 128, 128, 255.
+pub const FLAT_NORMAL: [f32; 4] = [128.0 / 255.0, 128.0 / 255.0, 1.0, 1.0];
 
 /// Which material map the brush / layer stack targets.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -10,17 +12,23 @@ pub enum PaintMap {
     Albedo,
     Metallic,
     Roughness,
+    Normal,
 }
 
 impl PaintMap {
-    pub const ALL: &'static [PaintMap] =
-        &[PaintMap::Albedo, PaintMap::Metallic, PaintMap::Roughness];
+    pub const ALL: &'static [PaintMap] = &[
+        PaintMap::Albedo,
+        PaintMap::Metallic,
+        PaintMap::Roughness,
+        PaintMap::Normal,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             PaintMap::Albedo => "Albedo",
             PaintMap::Metallic => "Metallic",
             PaintMap::Roughness => "Roughness",
+            PaintMap::Normal => "Normal",
         }
     }
 
@@ -29,6 +37,7 @@ impl PaintMap {
             PaintMap::Albedo => 0,
             PaintMap::Metallic => 1,
             PaintMap::Roughness => 2,
+            PaintMap::Normal => 3,
         }
     }
 
@@ -36,33 +45,74 @@ impl PaintMap {
     /// (glTF MR: G=roughness, B=metallic).
     pub fn channel_mask(self) -> [f32; 4] {
         match self {
-            PaintMap::Albedo => [1.0, 1.0, 1.0, 1.0],
+            PaintMap::Albedo | PaintMap::Normal => [1.0, 1.0, 1.0, 1.0],
             PaintMap::Roughness => [0.0, 1.0, 0.0, 0.0],
             PaintMap::Metallic => [0.0, 0.0, 1.0, 0.0],
         }
     }
 }
 
-/// One paint layer — GPU texture is the source of truth.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LayerKind {
+    #[default]
+    Paint,
+    Fill,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PaintTarget {
+    #[default]
+    Content,
+    Mask,
+}
+
+/// One stack layer — GPU texture is the source of truth for paint / mask pixels.
 pub struct Layer {
     pub name: String,
     pub visible: bool,
     pub opacity: f32,
-    pub tex: Handle<Texture>,
-    /// Clear GPU tex to transparent before next composite.
+    pub kind: LayerKind,
+    /// Fill color (linear). Paint layers ignore this.
+    pub fill: [f32; 4],
+    pub tex: Option<Handle<Texture>>,
+    pub mask: Option<Handle<Texture>>,
+    /// Clear GPU paint tex to transparent before next composite.
     pub needs_clear: bool,
+    /// Fill GPU mask with this RGBA8 before next composite (`None` = ready).
+    pub mask_init: Option<[u8; 4]>,
 }
 
 impl Layer {
-    pub fn new(name: impl Into<String>, tex: Handle<Texture>) -> Self {
+    pub fn paint(name: impl Into<String>, tex: Handle<Texture>) -> Self {
         Self {
             name: name.into(),
             visible: true,
             opacity: 1.0,
-            tex,
-            // gpu_resident tex is uninitialized until cleared.
+            kind: LayerKind::Paint,
+            fill: [1.0, 1.0, 1.0, 1.0],
+            tex: Some(tex),
+            mask: None,
             needs_clear: true,
+            mask_init: None,
         }
+    }
+
+    pub fn fill(name: impl Into<String>, color: [f32; 4]) -> Self {
+        Self {
+            name: name.into(),
+            visible: true,
+            opacity: 1.0,
+            kind: LayerKind::Fill,
+            fill: color,
+            tex: None,
+            mask: None,
+            needs_clear: false,
+            mask_init: None,
+        }
+    }
+
+    pub fn gpu_handles(&self) -> impl Iterator<Item = Handle<Texture>> {
+        self.tex.into_iter().chain(self.mask)
     }
 }
 
@@ -108,6 +158,10 @@ impl Default for Brush {
     }
 }
 
+pub fn luma(rgba: [f32; 4]) -> f32 {
+    0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
+}
+
 pub struct PaintDocument {
     pub width: u32,
     pub height: u32,
@@ -115,6 +169,7 @@ pub struct PaintDocument {
     pub base_rgba: [f32; 4],
     pub layers: Vec<Layer>,
     pub active: usize,
+    pub paint_target: PaintTarget,
     pub composite_dirty: bool,
 }
 
@@ -126,6 +181,7 @@ impl PaintDocument {
             base_rgba,
             layers: Vec::new(),
             active: 0,
+            paint_target: PaintTarget::Content,
             composite_dirty: true,
         }
     }
@@ -141,6 +197,19 @@ impl PaintDocument {
     }
 
     pub fn end_stroke(&mut self) {}
+
+    pub fn active_layer(&self) -> Option<&Layer> {
+        self.layers.get(self.active)
+    }
+
+    pub fn clamp_paint_target(&mut self) {
+        let ok = self
+            .active_layer()
+            .is_some_and(|l| l.mask.is_some() || self.paint_target == PaintTarget::Content);
+        if !ok {
+            self.paint_target = PaintTarget::Content;
+        }
+    }
 
     pub fn move_active(&mut self, delta: isize) {
         let n = self.layers.len() as isize;

@@ -7,11 +7,12 @@
 use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec2};
+use glam::{Mat4, Vec2, Vec3};
 use mega_render::{Handle, Mesh, Node, Scene};
 use mega_ui::Rect;
 use wgpu::util::DeviceExt;
 
+use crate::brush_alpha::{BrushAlpha, NormalStamp};
 use crate::paint::Brush;
 
 /// Uniform slot stride for dynamic-offset stack passes (WebGPU min alignment).
@@ -30,6 +31,7 @@ struct UvVertex {
     pos: [f32; 3],
     normal: [f32; 3],
     uv: [f32; 2],
+    tangent: [f32; 4],
 }
 
 #[repr(C)]
@@ -56,7 +58,8 @@ struct BrushUniforms {
     /// World-space brush radius.
     world_radius: f32,
     hardness: f32,
-    _pad0: f32,
+    /// 0 = distance hardness, 1 = coverage stamp (noise).
+    coverage_stamp: f32,
     /// WGSL uniform `vec4` aligns to 16 — pad 8 bytes after the f32 pair above.
     _pad_to_color: [f32; 2],
     color: [f32; 4],
@@ -71,6 +74,10 @@ struct BrushUniforms {
     tex_h: u32,
     /// Struct size rounded to 16 in WGSL uniform address space.
     _pad_end: [u32; 2],
+    /// Stamp plane normal (world).
+    normal: [f32; 3],
+    /// 1 = tangent-space normal stamp (RNM / flatten erase).
+    normal_mode: f32,
 }
 
 #[repr(C)]
@@ -79,10 +86,24 @@ struct StackUniforms {
     base: [f32; 4],
     channel_mask: [f32; 4],
     opacity: f32,
-    /// 0 = apply base (masked), 1 = blend layer over dst.
+    /// 0 = apply base, 1 = blend paint tex, 2 = fill color.
     mode: u32,
     tex_w: u32,
     tex_h: u32,
+    has_mask: u32,
+    /// 0 = alpha mix, 1 = whiteout normals.
+    blend: u32,
+    _pad: [u32; 2],
+}
+
+/// One layer in `composite_stack` (bottom → top).
+pub struct CompositeLayer<'a> {
+    pub opacity: f32,
+    /// 1 = paint texture, 2 = solid fill (`fill`).
+    pub mode: u32,
+    pub fill: [f32; 4],
+    pub content: Option<&'a wgpu::Texture>,
+    pub mask: Option<&'a wgpu::Texture>,
 }
 
 struct PaintMesh {
@@ -99,6 +120,8 @@ pub struct GpuPaint {
     uv_view: Option<wgpu::TextureView>,
     pos_tex: Option<wgpu::Texture>,
     pos_view: Option<wgpu::TextureView>,
+    tbn_tex: Option<wgpu::Texture>,
+    tbn_view: Option<wgpu::TextureView>,
     depth_tex: Option<wgpu::Texture>,
     depth_view: Option<wgpu::TextureView>,
     uv_size: (u32, u32),
@@ -122,11 +145,23 @@ pub struct GpuPaint {
     comp_bind_layout: wgpu::BindGroupLayout,
     brush_buf: wgpu::Buffer,
 
+    alpha_texs: Vec<wgpu::Texture>,
+    alpha_views: Vec<wgpu::TextureView>,
+    nrm_texs: Vec<wgpu::Texture>,
+    nrm_views: Vec<wgpu::TextureView>,
+    alpha_sampler: wgpu::Sampler,
+
     stack_pipeline: wgpu::ComputePipeline,
     stack_bind_layout: wgpu::BindGroupLayout,
     /// Packed stack uniforms (256-byte stride) — written once per composite.
     stack_buf: wgpu::Buffer,
     stack_buf_slots: u32,
+    /// 1×1 placeholder when a stack pass has no content/mask tex.
+    #[allow(dead_code)]
+    dummy_tex: wgpu::Texture,
+    dummy_view: wgpu::TextureView,
+    fill_px: [u8; 4],
+    fill_bytes: Vec<u8>,
 
     meshes: HashMap<(u32, u32), PaintMesh>,
 }
@@ -183,7 +218,8 @@ impl GpuPaint {
                     attributes: &wgpu::vertex_attr_array![
                         0 => Float32x3,
                         1 => Float32x3,
-                        2 => Float32x2
+                        2 => Float32x2,
+                        3 => Float32x4
                     ],
                 })],
             },
@@ -199,6 +235,11 @@ impl GpuPaint {
                     }),
                     Some(wgpu::ColorTargetState {
                         format: pos_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: uv_format,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -244,6 +285,9 @@ impl GpuPaint {
                 tex_entry(1),
                 tex_entry(2),
                 storage_entry(3),
+                sampled_tex_entry(4),
+                sampler_entry(5),
+                tex_entry(6),
             ],
         });
         let splat_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/splat.wgsl"));
@@ -312,6 +356,7 @@ impl GpuPaint {
                 tex_entry(1),
                 tex_entry(2),
                 storage_entry(3),
+                tex_entry(4),
             ],
         });
         let stack_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/stack.wgsl"));
@@ -336,6 +381,32 @@ impl GpuPaint {
             mapped_at_creation: false,
         });
 
+        let dummy_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gpu_paint_dummy"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let dummy_view = dummy_tex.create_view(&Default::default());
+
+        let alpha_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("gpu_paint_alpha_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         Self {
             uv_format,
             pos_format,
@@ -343,6 +414,8 @@ impl GpuPaint {
             uv_view: None,
             pos_tex: None,
             pos_view: None,
+            tbn_tex: None,
+            tbn_view: None,
             depth_tex: None,
             depth_view: None,
             uv_size: (0, 0),
@@ -366,14 +439,55 @@ impl GpuPaint {
             stack_bind_layout,
             stack_buf,
             stack_buf_slots: 8,
+            dummy_tex,
+            dummy_view,
+            fill_px: [0, 0, 0, 0],
+            fill_bytes: Vec::new(),
             meshes: HashMap::new(),
+            alpha_texs: Vec::new(),
+            alpha_views: Vec::new(),
+            nrm_texs: Vec::new(),
+            nrm_views: Vec::new(),
+            alpha_sampler,
         }
+    }
+
+    pub fn upload_alphas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, alphas: &[BrushAlpha]) {
+        self.alpha_texs.clear();
+        self.alpha_views.clear();
+        for alpha in alphas {
+            let (tex, view) = upload_stamp_rgba(device, queue, alpha.size, &alpha.rgba_preview());
+            self.alpha_texs.push(tex);
+            self.alpha_views.push(view);
+        }
+    }
+
+    pub fn upload_normals(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, stamps: &[NormalStamp]) {
+        self.nrm_texs.clear();
+        self.nrm_views.clear();
+        for stamp in stamps {
+            let (tex, view) = upload_stamp_rgba(device, queue, stamp.size, &stamp.rgba);
+            self.nrm_texs.push(tex);
+            self.nrm_views.push(view);
+        }
+    }
+
+    pub fn alpha_views(&self) -> &[wgpu::TextureView] {
+        &self.alpha_views
+    }
+
+    pub fn nrm_views(&self) -> &[wgpu::TextureView] {
+        &self.nrm_views
     }
 
     pub fn ensure_uv_targets(&mut self, device: &wgpu::Device, w: u32, h: u32) {
         let w = w.max(1);
         let h = h.max(1);
-        if self.uv_size == (w, h) && self.uv_tex.is_some() && self.pos_tex.is_some() {
+        if self.uv_size == (w, h)
+            && self.uv_tex.is_some()
+            && self.pos_tex.is_some()
+            && self.tbn_tex.is_some()
+        {
             return;
         }
         self.uv_size = (w, h);
@@ -410,6 +524,14 @@ impl GpuPaint {
         );
         self.pos_view = Some(pos_tex.create_view(&Default::default()));
         self.pos_tex = Some(pos_tex);
+
+        let tbn_tex = mk(
+            "gpu_paint_tbn_map",
+            self.uv_format,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        self.tbn_view = Some(tbn_tex.create_view(&Default::default()));
+        self.tbn_tex = Some(tbn_tex);
 
         let depth_tex = mk(
             "gpu_paint_uv_depth",
@@ -513,6 +635,9 @@ impl GpuPaint {
         let Some(pos_view) = self.pos_view.clone() else {
             return;
         };
+        let Some(tbn_view) = self.tbn_view.clone() else {
+            return;
+        };
         let Some(depth_view) = self.depth_view.clone() else {
             return;
         };
@@ -573,6 +698,15 @@ impl GpuPaint {
                         b: 0.0,
                         a: 0.0,
                     }),
+                    store: wgpu::StoreOp::Store,
+                },
+            }),
+            Some(wgpu::RenderPassColorAttachment {
+                view: &tbn_view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(UV_CLEAR),
                     store: wgpu::StoreOp::Store,
                 },
             }),
@@ -673,6 +807,10 @@ impl GpuPaint {
         center_px: Vec2,
         screen_radius_px: f32,
         world_radius: f32,
+        alpha_index: usize,
+        plane_normal: Vec3,
+        coverage_stamp: bool,
+        normal_mode: bool,
     ) {
         let (tw, th) = paint_size;
         let (mw, mh) = self.uv_size;
@@ -685,6 +823,9 @@ impl GpuPaint {
             return;
         };
         let Some(pos_view) = self.pos_view.clone() else {
+            return;
+        };
+        let Some(tbn_view) = self.tbn_view.clone() else {
             return;
         };
         let Some(paint_read) = self.paint_read.clone() else {
@@ -748,7 +889,7 @@ impl GpuPaint {
             screen_radius: screen_radius_px.max(2.0),
             world_radius: world_radius.max(1e-4),
             hardness: brush.hardness.clamp(0.0, 1.0),
-            _pad0: 0.0,
+            coverage_stamp: if coverage_stamp { 1.0 } else { 0.0 },
             _pad_to_color: [0.0; 2],
             color: brush.color,
             channel_mask,
@@ -759,8 +900,20 @@ impl GpuPaint {
             tex_w: tw,
             tex_h: th,
             _pad_end: [0; 2],
+            normal: plane_normal.normalize_or_zero().to_array(),
+            normal_mode: if normal_mode { 1.0 } else { 0.0 },
         };
         queue.write_buffer(&self.brush_buf, 0, bytemuck::bytes_of(&uniforms));
+
+        let views = if normal_mode {
+            &self.nrm_views
+        } else {
+            &self.alpha_views
+        };
+        let alpha_view = views
+            .get(alpha_index)
+            .or_else(|| views.first())
+            .unwrap_or(&self.dummy_view);
 
         let splat_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("gpu_paint_splat_bg"),
@@ -781,6 +934,18 @@ impl GpuPaint {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&stroke_storage_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(alpha_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&self.alpha_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&tbn_view),
                 },
             ],
         });
@@ -834,18 +999,42 @@ impl GpuPaint {
 
     /// Clear a gpu-resident paint texture to transparent black.
     pub fn clear_texture(&mut self, queue: &wgpu::Queue, tex: &wgpu::Texture, size: (u32, u32)) {
+        self.fill_texture(queue, tex, size, [0, 0, 0, 0]);
+    }
+
+    /// Fill a gpu-resident texture with a constant RGBA8 color.
+    pub fn fill_texture(
+        &mut self,
+        queue: &wgpu::Queue,
+        tex: &wgpu::Texture,
+        size: (u32, u32),
+        rgba: [u8; 4],
+    ) {
         let (w, h) = (size.0.max(1), size.1.max(1));
         let n = (w * h * 4) as usize;
-        if self.stroke_zeros.len() < n {
-            self.stroke_zeros.resize(n, 0);
+        if rgba == [0, 0, 0, 0] {
+            if self.stroke_zeros.len() < n {
+                self.stroke_zeros.resize(n, 0);
+            }
+            write_paint_rgba(queue, tex, &self.stroke_zeros[..n], w, h);
+            return;
         }
-        write_paint_rgba(queue, tex, &self.stroke_zeros[..n], w, h);
+        if self.fill_bytes.len() != n || self.fill_px != rgba {
+            self.fill_bytes.clear();
+            self.fill_bytes.resize(n, 0);
+            for px in self.fill_bytes.chunks_exact_mut(4) {
+                px.copy_from_slice(&rgba);
+            }
+            self.fill_px = rgba;
+        }
+        write_paint_rgba(queue, tex, &self.fill_bytes, w, h);
     }
 
     /// Composite layer stack into `dst` (material map).
     ///
     /// `channel_mask` selects which RGB channels are written (albedo all; MR G/B).
-    /// Layers are bottom → top. Each layer is straight RGBA (A = coverage).
+    /// Layers are bottom → top. Paint layers are straight RGBA (A = coverage).
+    /// Fill layers use `fill` as RGB with full coverage, then the layer mask.
     ///
     /// Uniforms for every pass are written once into a strided UBO — `queue.write_buffer`
     /// is not recorded in the encoder, so per-dispatch overwrites would make every
@@ -859,7 +1048,8 @@ impl GpuPaint {
         size: (u32, u32),
         base: [f32; 4],
         channel_mask: [f32; 4],
-        layers: &[(&wgpu::Texture, f32)],
+        layers: &[CompositeLayer<'_>],
+        nrm_blend: bool,
     ) {
         let (tw, th) = (size.0.max(1), size.1.max(1));
         self.ensure_aux(device, tw, th);
@@ -890,19 +1080,26 @@ impl GpuPaint {
                 mode: 0,
                 tex_w: tw,
                 tex_h: th,
+                has_mask: 0,
+                blend: 0,
+                _pad: [0; 2],
             },
         );
-        for (i, &(_, opacity)) in layers.iter().enumerate() {
+        let blend = u32::from(nrm_blend);
+        for (i, layer) in layers.iter().enumerate() {
             write_slot(
                 &mut blob,
                 (i + 1) as u32,
                 StackUniforms {
-                    base,
+                    base: if layer.mode == 2 { layer.fill } else { base },
                     channel_mask,
-                    opacity: opacity.clamp(0.0, 1.0),
-                    mode: 1,
+                    opacity: layer.opacity.clamp(0.0, 1.0),
+                    mode: layer.mode,
                     tex_w: tw,
                     tex_h: th,
+                    has_mask: u32::from(layer.mask.is_some()),
+                    blend,
+                    _pad: [0; 2],
                 },
             );
         }
@@ -915,12 +1112,15 @@ impl GpuPaint {
             ..Default::default()
         });
 
+        let dummy_view = &self.dummy_view;
+        let stack_buf = &self.stack_buf;
+        let stack_layout = &self.stack_bind_layout;
+        let pipeline = &self.stack_pipeline;
+
         let dispatch = |encoder: &mut wgpu::CommandEncoder,
-                        slot: u32,
-                        layer_view: &wgpu::TextureView,
-                        stack_buf: &wgpu::Buffer,
-                        stack_layout: &wgpu::BindGroupLayout,
-                        pipeline: &wgpu::ComputePipeline| {
+                            slot: u32,
+                            layer_view: &wgpu::TextureView,
+                            mask_view: &wgpu::TextureView| {
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: dst,
@@ -965,6 +1165,10 @@ impl GpuPaint {
                         binding: 3,
                         resource: wgpu::BindingResource::TextureView(&dst_view),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(mask_view),
+                    },
                 ],
             });
             {
@@ -978,27 +1182,14 @@ impl GpuPaint {
             }
         };
 
-        // 1) masked base
-        dispatch(
-            encoder,
-            0,
-            &paint_read_view,
-            &self.stack_buf,
-            &self.stack_bind_layout,
-            &self.stack_pipeline,
-        );
+        dispatch(encoder, 0, dummy_view, dummy_view);
 
-        // 2) blend layers bottom → top
-        for (i, &(layer_tex, _)) in layers.iter().enumerate() {
-            let layer_view = layer_tex.create_view(&Default::default());
-            dispatch(
-                encoder,
-                (i + 1) as u32,
-                &layer_view,
-                &self.stack_buf,
-                &self.stack_bind_layout,
-                &self.stack_pipeline,
-            );
+        for (i, layer) in layers.iter().enumerate() {
+            let content_view = layer.content.map(|t| t.create_view(&Default::default()));
+            let mask_view = layer.mask.map(|t| t.create_view(&Default::default()));
+            let lv = content_view.as_ref().unwrap_or(dummy_view);
+            let mv = mask_view.as_ref().unwrap_or(dummy_view);
+            dispatch(encoder, (i + 1) as u32, lv, mv);
         }
     }
 
@@ -1030,6 +1221,28 @@ fn ubo_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+fn sampled_tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
 fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -1056,6 +1269,49 @@ fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+fn upload_stamp_rgba(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    size: u32,
+    rgba: &[u8],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("gpu_paint_stamp"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * size),
+            rows_per_image: Some(size),
+        },
+        wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = tex.create_view(&Default::default());
+    (tex, view)
+}
+
 fn upload_paint_mesh(device: &wgpu::Device, mesh: &Mesh) -> PaintMesh {
     let verts: Vec<UvVertex> = mesh
         .positions
@@ -1069,6 +1325,11 @@ fn upload_paint_mesh(device: &wgpu::Device, mesh: &Mesh) -> PaintMesh {
                 .first()
                 .and_then(|c| c.get(i).copied())
                 .unwrap_or([0.0, 0.0]),
+            tangent: mesh
+                .tangents
+                .get(i)
+                .copied()
+                .unwrap_or([1.0, 0.0, 0.0, 1.0]),
         })
         .collect();
     PaintMesh {

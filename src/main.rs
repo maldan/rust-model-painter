@@ -1,4 +1,5 @@
 mod app;
+mod brush_alpha;
 mod bvh;
 mod gpu_paint;
 mod paint;
@@ -9,12 +10,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use app::{Painter, SCENE_TEX};
+use brush_alpha::{ALPHA_TEX_BASE, NRM_TEX_BASE};
 use glam::Vec2;
-use gpu_paint::{cursor_to_map_px, write_paint_rgba, GpuPaint};
+use gpu_paint::{cursor_to_map_px, write_paint_rgba, CompositeLayer, GpuPaint};
 use mega_render::{Visualizer, WgpuVisualizer};
 use mega_ui::wgpu::UiRenderer;
 use mega_ui::{CursorIcon, Ui, UiInput};
-use paint::{PaintMap, PaintTool, TEX_SIZE};
+use paint::{luma, LayerKind, PaintMap, PaintTool, TEX_SIZE};
 use pick::find_viewport_rect;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -310,7 +312,23 @@ impl Host {
         let mut ui_renderer = UiRenderer::new(&device, &queue, format, &self.ui);
         ui_renderer.set_viewport(&queue, width as f32, height as f32);
         let scene_target = SceneTarget::ensure(&device, &mut ui_renderer, vp);
-        let gpu_paint = GpuPaint::new(&device);
+        let mut gpu_paint = GpuPaint::new(&device);
+        gpu_paint.upload_alphas(&device, &queue, &self.painter.alphas);
+        gpu_paint.upload_normals(&device, &queue, &self.painter.nrm_stamps);
+        for (i, view) in gpu_paint.alpha_views().iter().enumerate() {
+            ui_renderer.bind_texture_view(
+                &device,
+                ALPHA_TEX_BASE + i as u32,
+                view.clone(),
+            );
+        }
+        for (i, view) in gpu_paint.nrm_views().iter().enumerate() {
+            ui_renderer.bind_texture_view(
+                &device,
+                NRM_TEX_BASE + i as u32,
+                view.clone(),
+            );
+        }
 
         self.gpu = Some(Gpu {
             device,
@@ -497,8 +515,9 @@ impl Host {
             if self.painter.needs_map_seed {
                 let albedo = gpu.visualizer.texture_gpu(self.painter.albedo_tex).cloned();
                 let mr = gpu.visualizer.texture_gpu(self.painter.mr_tex).cloned();
-                if let (Some(albedo), Some(mr)) = (albedo, mr) {
-                    self.painter.seed_map_pixels(&gpu.queue, &albedo, &mr);
+                let nrm = gpu.visualizer.texture_gpu(self.painter.nrm_tex).cloned();
+                if let (Some(albedo), Some(mr), Some(nrm)) = (albedo, mr, nrm) {
+                    self.painter.seed_map_pixels(&gpu.queue, &albedo, &mr, &nrm);
                     self.painter.needs_map_seed = false;
                     for doc in &mut self.painter.docs {
                         doc.mark_dirty();
@@ -506,20 +525,41 @@ impl Host {
                 }
             }
 
-            // Clear layers flagged by UI (after sync so GPU tex exists).
+            // Clear / init layer and mask textures flagged by UI (after sync so GPU tex exists).
             for doc in &mut self.painter.docs {
                 for layer in &mut doc.layers {
-                    if !layer.needs_clear {
-                        continue;
+                    if layer.needs_clear {
+                        if let Some(h) = layer.tex {
+                            let Some(tex) = gpu.visualizer.texture_gpu(h).cloned() else {
+                                doc.composite_dirty = true;
+                                continue;
+                            };
+                            gpu.gpu_paint.clear_texture(&gpu.queue, &tex, (TEX_SIZE, TEX_SIZE));
+                            layer.needs_clear = false;
+                            doc.composite_dirty = true;
+                        } else {
+                            layer.needs_clear = false;
+                        }
                     }
-                    let Some(tex) = gpu.visualizer.texture_gpu(layer.tex).cloned() else {
-                        // Keep needs_clear until the GPU tex is actually created.
-                        doc.composite_dirty = true;
-                        continue;
-                    };
-                    gpu.gpu_paint.clear_texture(&gpu.queue, &tex, (TEX_SIZE, TEX_SIZE));
-                    layer.needs_clear = false;
-                    doc.composite_dirty = true;
+                    if layer.mask_init.is_some() {
+                        if let Some(h) = layer.mask {
+                            let Some(tex) = gpu.visualizer.texture_gpu(h).cloned() else {
+                                doc.composite_dirty = true;
+                                continue;
+                            };
+                            let rgba = layer.mask_init.unwrap_or([255, 255, 255, 255]);
+                            gpu.gpu_paint.fill_texture(
+                                &gpu.queue,
+                                &tex,
+                                (TEX_SIZE, TEX_SIZE),
+                                rgba,
+                            );
+                            layer.mask_init = None;
+                            doc.composite_dirty = true;
+                        } else {
+                            layer.mask_init = None;
+                        }
+                    }
                 }
             }
 
@@ -543,11 +583,24 @@ impl Host {
                     aspect,
                 );
 
-                // Stamp into the active layer — never into the material composite.
-                if let Some(layer_h) = self.painter.active_layer_tex() {
+                // Stamp into the active paint layer or its mask — never into the material composite.
+                if let Some(layer_h) = self.painter.stamp_target_tex() {
                     let paint_tex = gpu.visualizer.texture_gpu(layer_h).cloned();
                     let stamp_brush = self.painter.stamp_brush();
                     let erase = self.painter.tool == PaintTool::Eraser;
+                    let nrm_stamp = self.painter.paint_map == PaintMap::Normal
+                        && !self.painter.painting_mask();
+                    let (stamp_idx, coverage_stamp) = if nrm_stamp {
+                        (self.painter.active_nrm, false)
+                    } else {
+                        (
+                            self.painter.active_alpha,
+                            self.painter
+                                .alphas
+                                .get(self.painter.active_alpha)
+                                .is_some_and(|a| a.coverage_stamp),
+                        )
+                    };
                     if let Some(paint_tex) = paint_tex {
                         for stamp in &stamps {
                             let center = cursor_to_map_px(stamp.screen, stamp.viewport, vp_w, vp_h);
@@ -564,6 +617,10 @@ impl Host {
                                 center,
                                 screen_r,
                                 stamp_brush.radius,
+                                stamp_idx,
+                                stamp.plane_normal,
+                                coverage_stamp,
+                                nrm_stamp,
                             );
                         }
                         did_stamp = true;
@@ -603,6 +660,7 @@ impl Host {
                 let dst_h = match map {
                     PaintMap::Albedo => self.painter.albedo_tex,
                     PaintMap::Metallic | PaintMap::Roughness => self.painter.mr_tex,
+                    PaintMap::Normal => self.painter.nrm_tex,
                 };
                 let Some(dst) = gpu.visualizer.texture_gpu(dst_h).cloned() else {
                     self.painter.docs[map.index()].mark_dirty();
@@ -610,24 +668,54 @@ impl Host {
                 };
 
                 // Collect layer GPU textures (bottom → top). Missing / uncleared → base-only, retry later.
-                let layer_handles: Vec<_> = self.painter.docs[map.index()]
+                let mut owned: Vec<(f32, u32, [f32; 4], Option<wgpu::Texture>, Option<wgpu::Texture>)> =
+                    Vec::new();
+                let mut layers_ready = true;
+                for layer in self.painter.docs[map.index()]
                     .layers
                     .iter()
                     .filter(|l| l.visible && l.opacity > 0.001)
-                    .map(|l| (l.tex, l.opacity, l.needs_clear))
-                    .collect();
-                let mut layer_texs = Vec::with_capacity(layer_handles.len());
-                let mut layers_ready = true;
-                for &(h, opacity, needs_clear) in &layer_handles {
-                    if needs_clear {
+                {
+                    if layer.needs_clear || layer.mask_init.is_some() {
                         layers_ready = false;
                         break;
                     }
-                    let Some(t) = gpu.visualizer.texture_gpu(h).cloned() else {
-                        layers_ready = false;
-                        break;
+                    let content = match layer.kind {
+                        LayerKind::Paint => {
+                            let Some(h) = layer.tex else {
+                                layers_ready = false;
+                                break;
+                            };
+                            let Some(t) = gpu.visualizer.texture_gpu(h).cloned() else {
+                                layers_ready = false;
+                                break;
+                            };
+                            Some(t)
+                        }
+                        LayerKind::Fill => None,
                     };
-                    layer_texs.push((t, opacity));
+                    let mask = if let Some(h) = layer.mask {
+                        let Some(t) = gpu.visualizer.texture_gpu(h).cloned() else {
+                            layers_ready = false;
+                            break;
+                        };
+                        Some(t)
+                    } else {
+                        None
+                    };
+                    let fill = match map {
+                        PaintMap::Albedo => layer.fill,
+                        PaintMap::Normal => layer.fill,
+                        PaintMap::Metallic | PaintMap::Roughness => {
+                            let v = luma(layer.fill);
+                            [v, v, v, 1.0]
+                        }
+                    };
+                    let mode = match layer.kind {
+                        LayerKind::Paint => 1,
+                        LayerKind::Fill => 2,
+                    };
+                    owned.push((layer.opacity, mode, fill, content, mask));
                 }
 
                 let mut encoder = gpu.device.create_command_encoder(
@@ -646,10 +734,20 @@ impl Host {
                         self.painter.docs[map.index()].base_rgba,
                         map.channel_mask(),
                         &[],
+                        map == PaintMap::Normal,
                     );
                     self.painter.docs[map.index()].mark_dirty();
                 } else {
-                    let layer_refs: Vec<_> = layer_texs.iter().map(|(t, o)| (t, *o)).collect();
+                    let layer_refs: Vec<CompositeLayer<'_>> = owned
+                        .iter()
+                        .map(|(opacity, mode, fill, content, mask)| CompositeLayer {
+                            opacity: *opacity,
+                            mode: *mode,
+                            fill: *fill,
+                            content: content.as_ref(),
+                            mask: mask.as_ref(),
+                        })
+                        .collect();
                     gpu.gpu_paint.composite_stack(
                         &gpu.device,
                         &gpu.queue,
@@ -659,6 +757,7 @@ impl Host {
                         self.painter.docs[map.index()].base_rgba,
                         map.channel_mask(),
                         &layer_refs,
+                        map == PaintMap::Normal,
                     );
                 }
                 gpu.queue.submit(Some(encoder.finish()));

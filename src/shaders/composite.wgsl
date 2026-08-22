@@ -3,7 +3,7 @@ struct Brush {
     screen_radius: f32,
     world_radius: f32,
     hardness: f32,
-    _pad0: f32,
+    coverage_stamp: f32,
     _pad_to_color: vec2<f32>,
     color: vec4<f32>,
     channel_mask: vec4<f32>,
@@ -14,6 +14,8 @@ struct Brush {
     tex_w: u32,
     tex_h: u32,
     _pad_end: vec2<u32>,
+    normal: vec3<f32>,
+    normal_mode: f32,
 }
 
 @group(0) @binding(0) var<uniform> brush: Brush;
@@ -21,13 +23,24 @@ struct Brush {
 @group(0) @binding(2) var stroke_src: texture_2d<f32>;
 @group(0) @binding(3) var paint_dst: texture_storage_2d<rgba8unorm, write>;
 
+fn unpack_n(c: vec3<f32>) -> vec3<f32> {
+    return normalize(c * 2.0 - 1.0);
+}
+
+fn pack_n(n: vec3<f32>) -> vec3<f32> {
+    return n * 0.5 + 0.5;
+}
+
+fn blend_whiteout(n1: vec3<f32>, n2: vec3<f32>) -> vec3<f32> {
+    return normalize(vec3<f32>(n1.xy + n2.xy, n1.z * n2.z));
+}
+
 @compute @workgroup_size(8, 8)
 fn composite(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= brush.tex_w || id.y >= brush.tex_h) { return; }
     let tc = vec2<i32>(i32(id.x), i32(id.y));
     let src = textureLoad(paint_src, tc, 0);
 
-    // Tiny seam pad only — large dilate was leaking into back-side UV islands.
     let R = 1;
     var best_a = 0.0;
     var best_rgb = vec3<f32>(0.0);
@@ -50,16 +63,30 @@ fn composite(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    // Eraser: same cover/opacity as paint, but removes layer alpha.
+    let flat = vec3<f32>(0.5, 0.5, 1.0);
+
+    if (brush.normal_mode > 0.5) {
+        if (brush.erase > 0.5) {
+            let out_rgb = mix(src.rgb, flat, best_a);
+            textureStore(paint_dst, tc, vec4<f32>(out_rgb, src.a));
+            return;
+        }
+        let base_rgb = select(flat, src.rgb, src.a > 0.001);
+        let n_dst = unpack_n(base_rgb);
+        let n_src = unpack_n(best_rgb);
+        let n_b = blend_whiteout(n_dst, n_src);
+        let n_out = normalize(mix(n_dst, n_b, best_a));
+        let out_a = src.a + best_a * (1.0 - src.a);
+        textureStore(paint_dst, tc, vec4<f32>(pack_n(n_out), out_a));
+        return;
+    }
+
     if (brush.erase > 0.5) {
         let out_a = src.a * (1.0 - best_a);
         textureStore(paint_dst, tc, vec4<f32>(src.rgb, out_a));
         return;
     }
 
-    // Straight-alpha "over": keep brush RGB intact, coverage only in A.
-    // (Old mix(src, rgb, a) wrote premultiplied-looking RGB into the layer; stack
-    // then multiplied by A again → washed-out sides where facing fade lowers a.)
     let mask = brush.channel_mask.rgb;
     let sa = best_a;
     let da = src.a;
