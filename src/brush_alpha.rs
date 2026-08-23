@@ -183,9 +183,16 @@ pub fn generate_normal_stamps() -> Vec<NormalStamp> {
         bake_height("Dome", dome_h),
         bake_height("Groove", groove_h),
         bake_height("Bevel", bevel_h),
+        bake_height("Gouge", gouge_h),
+        bake_height("Chamfer", chamfer_h),
         bake_height("Rivet", rivet_h),
         bake_height("Ridge", ridge_h),
         bake_height("Noise", noise_h),
+        bake_height("Veins", veins_h),
+        bake_height("Pores", pores_h),
+        bake_height("Crease", crease_h),
+        bake_height("Wrinkles", wrinkles_h),
+        bake_height("Folds", folds_h),
     ]
 }
 
@@ -247,6 +254,22 @@ fn bevel_h(x: f32, y: f32) -> f32 {
     (1.0 - (d / 0.16).clamp(0.0, 1.0)).powi(2)
 }
 
+fn line_along(y: f32) -> f32 {
+    (1.0 - y.abs()).max(0.0).powi(2)
+}
+
+/// Groove profile, but a straight cut instead of a ring.
+fn gouge_h(x: f32, y: f32) -> f32 {
+    let d = x.abs();
+    -(1.0 - (d / 0.18).clamp(0.0, 1.0)).powi(2) * line_along(y)
+}
+
+/// Bevel profile as a straight raised edge.
+fn chamfer_h(x: f32, y: f32) -> f32 {
+    let d = x.abs();
+    (1.0 - (d / 0.16).clamp(0.0, 1.0)).powi(2) * line_along(y)
+}
+
 fn rivet_h(x: f32, y: f32) -> f32 {
     let r2 = x * x + y * y;
     if r2 > 0.12 {
@@ -262,10 +285,121 @@ fn ridge_h(x: f32, y: f32) -> f32 {
 }
 
 fn noise_h(x: f32, y: f32) -> f32 {
+    disk_win(x, y) * (fbm(x, y) * 2.0 - 1.0)
+}
+
+fn disk_win(x: f32, y: f32) -> f32 {
     let r = (x * x + y * y).sqrt();
     if r >= 1.0 {
         return 0.0;
     }
-    let win = (1.0 - r).clamp(0.0, 1.0);
-    (fbm(x, y) * 2.0 - 1.0) * win * win
+    let t = (1.0 - r).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn tube(d: f32, half: f32) -> f32 {
+    let t = (1.0 - (d / half.max(1e-4)).clamp(0.0, 1.0)).max(0.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn vessel(d: f32, half: f32) -> f32 {
+    let body = tube(d, half);
+    let core = tube(d, half * 0.4);
+    body * 0.55 + core * 0.7
+}
+
+/// A few long meandering trunks — readable, not a noise web.
+fn veins_h(x: f32, y: f32) -> f32 {
+    let r = (x * x + y * y).sqrt();
+    if r >= 1.0 {
+        return 0.0;
+    }
+    let w = (1.0 - r).clamp(0.0, 1.0).powf(0.4);
+    let wander = (value_noise(x * 1.4 + 2.0, y * 1.1 - 1.5) - 0.5) * 0.16
+        + 0.10 * (y * 2.6).sin()
+        + 0.05 * (y * 5.1).sin();
+
+    let main = vessel((x - wander).abs(), 0.055);
+    let side = vessel((x - 0.28 - wander * 0.7 - 0.08 * (y * 3.4).cos()).abs(), 0.032)
+        * (0.25 + 0.75 * (1.0 - ((y + 0.15) / 1.3).abs()).clamp(0.0, 1.0));
+    let branch = vessel((y - 0.08 - 0.55 * x - wander * 0.5).abs(), 0.028)
+        * (1.0 - (x - 0.1).abs() * 1.15).clamp(0.0, 1.0);
+
+    main.max(side * 0.72).max(branch * 0.58) * w * 1.15
+}
+
+/// Tight skin pits plus a bit of grain.
+fn pores_h(x: f32, y: f32) -> f32 {
+    let w = disk_win(x, y);
+    if w <= 0.0 {
+        return 0.0;
+    }
+    let scale = 8.0;
+    let gx = x * scale;
+    let gy = y * scale;
+    let ix = gx.floor();
+    let iy = gy.floor();
+    let mut h = 0.0;
+    for oy in -1..=1 {
+        for ox in -1..=1 {
+            let cx = ix + ox as f32;
+            let cy = iy + oy as f32;
+            let jx = hash_i(cx, cy);
+            let jy = hash_i(cx + 19.0, cy - 7.0);
+            let dx = gx - (cx + 0.22 + jx * 0.56);
+            let dy = gy - (cy + 0.22 + jy * 0.56);
+            let d2 = dx * dx + dy * dy;
+            let rad = 0.07 + hash_i(cx - 3.0, cy + 11.0) * 0.11;
+            let rad2 = rad * rad;
+            if d2 < rad2 {
+                let t = 1.0 - d2 / rad2;
+                let depth = 0.35 + hash_i(cy, cx + 4.0) * 0.65;
+                h -= t * t * depth;
+            }
+        }
+    }
+    h += (fbm(x * 2.2, y * 2.2) - 0.5) * 0.18;
+    h * w
+}
+
+/// Single skin crease: valley with raised lips.
+fn crease_h(x: f32, y: f32) -> f32 {
+    let w = disk_win(x, y);
+    if w <= 0.0 {
+        return 0.0;
+    }
+    let warp = (value_noise(x * 2.6 + 4.0, y * 1.7) - 0.5) * 0.22;
+    let d = (y + 0.16 * (x * 3.1).sin() + warp).abs();
+    let valley = -tube(d, 0.11);
+    let lips = tube((d - 0.09).abs(), 0.07) * 0.42;
+    (valley + lips) * w
+}
+
+/// Packed parallel wrinkles, domain-warped.
+fn wrinkles_h(x: f32, y: f32) -> f32 {
+    let w = disk_win(x, y);
+    if w <= 0.0 {
+        return 0.0;
+    }
+    let warp = fbm(x * 1.4 + 2.0, y * 1.1 - 3.0);
+    let phase = y * 10.0 + warp * 3.6 + x * 1.3;
+    let wave = phase.sin();
+    let sharp = -wave.abs().powf(0.55);
+    let vary = 0.55 + 0.45 * value_noise(x * 3.0, y * 0.8);
+    sharp * vary * w
+}
+
+/// Thicker flesh fold: two ridges around a valley, slightly curved.
+fn folds_h(x: f32, y: f32) -> f32 {
+    let w = disk_win(x, y);
+    if w <= 0.0 {
+        return 0.0;
+    }
+    let warp = (value_noise(x * 1.8 - 2.0, y * 2.4 + 6.0) - 0.5) * 0.28;
+    let d = y + 0.22 * (x * 2.4).sin() + warp;
+    let valley = -tube(d.abs(), 0.16) * 0.85;
+    let r1 = tube((d - 0.18).abs(), 0.12) * 0.95;
+    let r2 = tube((d + 0.18).abs(), 0.12) * 0.95;
+    let grain = (fbm(x * 3.5, y * 3.5) - 0.5) * 0.12;
+    (valley + r1 + r2 + grain) * w
 }

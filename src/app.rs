@@ -450,13 +450,15 @@ impl Painter {
 
     pub fn apply_camera(&mut self) {
         self.orbit_pitch = self.orbit_pitch.clamp(-1.4, 1.4);
-        self.orbit_dist = self.orbit_dist.clamp(0.5, 80.0);
+        self.orbit_dist = self.orbit_dist.clamp(0.02, 80.0);
         self.scene.camera = Camera::orbit(
             self.orbit_yaw,
             self.orbit_pitch,
             self.orbit_dist,
             self.orbit_target,
         );
+        // Default near is 0.1 — closer than that and the model gets clipped.
+        self.scene.camera.near = (self.orbit_dist * 0.05).clamp(0.001, 0.1);
     }
 
     pub fn set_shape(&mut self, shape: usize) {
@@ -834,7 +836,7 @@ impl Painter {
             r = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
         }
         let u = f.cross(r).normalize_or_zero();
-        let scale = self.orbit_dist.max(0.5) * 0.0015;
+        let scale = self.orbit_dist.max(0.02) * 0.0015;
         self.orbit_target += r * (-dx * scale) + u * (dy * scale);
         self.apply_camera();
     }
