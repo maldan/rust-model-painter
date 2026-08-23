@@ -14,7 +14,7 @@ struct Brush {
     map_h: u32,
     tex_w: u32,
     tex_h: u32,
-    _pad_end: vec2<u32>,
+    tile: vec2<f32>,
     normal: vec3<f32>,
     normal_mode: f32,
 }
@@ -127,7 +127,11 @@ fn splat(@builtin(global_invocation_id) id: vec3<u32>) {
     cover *= facing_fade;
     if (cover < 0.001) { return; }
 
-    let uv = clamp(sample_uv.xy, vec2<f32>(0.0), vec2<f32>(0.99999));
+    let tile = floor(sample_uv.xy);
+    if (abs(tile.x - brush.tile.x) > 0.1 || abs(tile.y - brush.tile.y) > 0.1) {
+        return;
+    }
+    let uv = min(fract(sample_uv.xy), vec2<f32>(0.99999));
     let tc = vec2<i32>(
         i32(floor(uv.x * f32(brush.tex_w))),
         i32(floor(uv.y * f32(brush.tex_h))),

@@ -75,7 +75,10 @@ pub struct Layer {
     /// Fill color (linear). Paint layers ignore this.
     pub fill: [f32; 4],
     pub tex: Option<Handle<Texture>>,
+    /// Extra UDIM tiles after the first (`tex` is `udim_ids[0]`).
+    pub extra_tex: Vec<(u32, Handle<Texture>)>,
     pub mask: Option<Handle<Texture>>,
+    pub extra_mask: Vec<(u32, Handle<Texture>)>,
     /// Clear GPU paint tex to transparent before next composite.
     pub needs_clear: bool,
     /// Fill GPU mask with this RGBA8 before next composite (`None` = ready).
@@ -91,7 +94,9 @@ impl Layer {
             kind: LayerKind::Paint,
             fill: [1.0, 1.0, 1.0, 1.0],
             tex: Some(tex),
+            extra_tex: Vec::new(),
             mask: None,
+            extra_mask: Vec::new(),
             needs_clear: true,
             mask_init: None,
         }
@@ -105,14 +110,28 @@ impl Layer {
             kind: LayerKind::Fill,
             fill: color,
             tex: None,
+            extra_tex: Vec::new(),
             mask: None,
+            extra_mask: Vec::new(),
             needs_clear: false,
             mask_init: None,
         }
     }
 
     pub fn gpu_handles(&self) -> impl Iterator<Item = Handle<Texture>> {
-        self.tex.into_iter().chain(self.mask)
+        self.tex
+            .into_iter()
+            .chain(self.extra_tex.iter().map(|(_, h)| *h))
+            .chain(self.mask)
+            .chain(self.extra_mask.iter().map(|(_, h)| *h))
+    }
+
+    pub fn content_tiles(&self, ids: &[u32]) -> Vec<(u32, Handle<Texture>)> {
+        tiles_for(ids, self.tex, &self.extra_tex)
+    }
+
+    pub fn mask_tiles(&self, ids: &[u32]) -> Vec<(u32, Handle<Texture>)> {
+        tiles_for(ids, self.mask, &self.extra_mask)
     }
 }
 
@@ -156,6 +175,22 @@ impl Default for Brush {
             spacing: 0.35,
         }
     }
+}
+
+fn tiles_for(
+    ids: &[u32],
+    first: Option<Handle<Texture>>,
+    extra: &[(u32, Handle<Texture>)],
+) -> Vec<(u32, Handle<Texture>)> {
+    let Some(h0) = first else {
+        return extra.to_vec();
+    };
+    let Some(&id0) = ids.first() else {
+        return vec![(1001, h0)];
+    };
+    let mut out = vec![(id0, h0)];
+    out.extend_from_slice(extra);
+    out
 }
 
 pub fn luma(rgba: [f32; 4]) -> f32 {

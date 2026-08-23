@@ -13,7 +13,7 @@ struct Brush {
     map_h: u32,
     tex_w: u32,
     tex_h: u32,
-    _pad_end: vec2<u32>,
+    tile: vec2<f32>,
     normal: vec3<f32>,
     normal_mode: f32,
 }

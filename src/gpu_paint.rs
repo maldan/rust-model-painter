@@ -72,8 +72,8 @@ struct BrushUniforms {
     map_h: u32,
     tex_w: u32,
     tex_h: u32,
-    /// Struct size rounded to 16 in WGSL uniform address space.
-    _pad_end: [u32; 2],
+    /// UDIM tile origin (`floor(uv)`), e.g. (1,0) for 1002.
+    tile: [f32; 2],
     /// Stamp plane normal (world).
     normal: [f32; 3],
     /// 1 = tangent-space normal stamp (RNM / flatten erase).
@@ -811,6 +811,7 @@ impl GpuPaint {
         plane_normal: Vec3,
         coverage_stamp: bool,
         normal_mode: bool,
+        tile: [f32; 2],
     ) {
         let (tw, th) = paint_size;
         let (mw, mh) = self.uv_size;
@@ -899,7 +900,7 @@ impl GpuPaint {
             map_h: mh,
             tex_w: tw,
             tex_h: th,
-            _pad_end: [0; 2],
+            tile,
             normal: plane_normal.normalize_or_zero().to_array(),
             normal_mode: if normal_mode { 1.0 } else { 0.0 },
         };

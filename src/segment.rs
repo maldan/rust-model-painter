@@ -158,6 +158,20 @@ impl Segmentation {
         self.counts.get(&id).copied().unwrap_or(0)
     }
 
+    pub fn leftover_faces(&self) -> usize {
+        self.meshes
+            .values()
+            .map(|ms| ms.labels.iter().filter(|&&id| id == UNASSIGNED).count())
+            .sum()
+    }
+
+    pub fn label_of(&self, mesh: Handle<Mesh>, tri: u32) -> SegmentId {
+        self.meshes
+            .get(&mesh.key())
+            .and_then(|m| m.labels.get(tri as usize).copied())
+            .unwrap_or(UNASSIGNED)
+    }
+
     pub fn sync(&mut self, scene: &Scene, paintable: &[Handle<Node>]) {
         let mut keep = HashSet::new();
         for &nh in paintable {

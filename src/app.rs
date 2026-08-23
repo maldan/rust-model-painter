@@ -5,8 +5,9 @@ use std::time::Instant;
 
 use glam::{Mat4, Vec2, Vec3};
 use mega_render::{
-    cube, load_gltf, plane, sphere, Camera, DebugView, Handle, HudRect, InputFrame, Light, Material,
-    Mesh, Node, PolyOpts, PostProcessSettings, Scene, Texture, Transform,
+    cube, load_gltf, plane, sphere, view_gizmo, Camera, DebugView, Handle, HudRect, InputFrame,
+    Light, Material, MaterialMaps, Mesh, Node, PolyOpts, PostProcessSettings, Projection, Scene,
+    Texture, Transform,
 };
 use mega_ui::{DockNode, DockState, Rect};
 
@@ -16,11 +17,22 @@ use crate::paint::{
 };
 use crate::pick::{self, BvhCache};
 use crate::segment::{AppMode, SegOp, SegTool, Segmentation, UNASSIGNED};
+use crate::uv::{self, TriPack, UnwrapAlgo};
+use crate::uv_view::UvView;
 
 mod post_ui;
 mod ui;
 
 pub const SCENE_TEX: u32 = 0;
+pub const UV_TEX: u32 = 1;
+
+struct OrbitSnap {
+    from_yaw: f32,
+    from_pitch: f32,
+    to_yaw: f32,
+    to_pitch: f32,
+    t: f32,
+}
 
 #[derive(Clone, Copy)]
 pub struct PendingStamp {
@@ -45,13 +57,22 @@ pub struct Painter {
     pub albedo_tex: Handle<Texture>,
     pub mr_tex: Handle<Texture>,
     pub nrm_tex: Handle<Texture>,
+    /// Live UDIM ids, first is `albedo_tex` / `mr_tex` / `nrm_tex`.
+    pub udim_ids: Vec<u32>,
+    extra_albedo: Vec<(u32, Handle<Texture>)>,
+    extra_mr: Vec<(u32, Handle<Texture>)>,
+    extra_nrm: Vec<(u32, Handle<Texture>)>,
     pub paintable: Vec<Handle<Node>>,
     pub dock: DockState,
     pub viewport_size: Vec2,
+    pub uv: UvView,
     pub orbit_yaw: f32,
     pub orbit_pitch: f32,
     pub orbit_dist: f32,
     pub orbit_target: Vec3,
+    orbit_snap: Option<OrbitSnap>,
+    /// View-gizmo axis snap uses ortho until the user orbits again.
+    ortho_from_view: bool,
     pub painting: bool,
     pub mode: AppMode,
     pub seg_tool: SegTool,
@@ -128,9 +149,14 @@ impl Painter {
             doc.mark_dirty();
         }
 
-        let mut paint_mat_data = Material::new([1.0, 1.0, 1.0, 1.0], 1.0, 1.0).with_map(albedo_tex);
-        paint_mat_data.metallic_roughness_map = Some(mr_tex);
-        paint_mat_data.normal_map = Some(nrm_tex);
+        let paint_mat_data = Material {
+            maps: MaterialMaps::Single {
+                albedo: Some(albedo_tex),
+                normal: Some(nrm_tex),
+                metallic_roughness: Some(mr_tex),
+            },
+            ..Material::new([1.0, 1.0, 1.0, 1.0], 1.0, 1.0)
+        };
         let paint_mat = scene.materials.insert(paint_mat_data);
         let ground_mat = scene
             .materials
@@ -194,25 +220,32 @@ impl Painter {
             albedo_tex,
             mr_tex,
             nrm_tex,
+            udim_ids: vec![1001],
+            extra_albedo: Vec::new(),
+            extra_mr: Vec::new(),
+            extra_nrm: Vec::new(),
             paintable: vec![sphere_node],
             dock: DockState::new(DockNode::split_h(
                 0.15,
                 DockNode::leaf(&["Alphas"]),
                 DockNode::split_h(
                     0.72,
-                    DockNode::leaf(&["Viewport"]),
+                    DockNode::leaf(&["Viewport", "UV"]),
                     DockNode::split_v(
                         0.55,
                         DockNode::leaf(&["Brush", "Lights", "Effects"]),
-                        DockNode::leaf(&["Layers", "Segments"]),
+                        DockNode::leaf(&["Layers", "Segments", "Meshes"]),
                     ),
                 ),
             )),
             viewport_size: Vec2::new(1280.0, 720.0),
+            uv: UvView::default(),
             orbit_yaw: 0.7,
             orbit_pitch: 0.35,
             orbit_dist: 4.0,
             orbit_target: Vec3::new(0.0, 0.55, 0.0),
+            orbit_snap: None,
+            ortho_from_view: false,
             painting: false,
             mode: AppMode::Paint,
             seg_tool: SegTool::Click,
@@ -256,15 +289,24 @@ impl Painter {
         &mut self.docs[self.paint_map.index()]
     }
 
-    pub fn stamp_target_tex(&self) -> Option<Handle<Texture>> {
+    pub fn uv_mesh_node(&self) -> Option<Handle<Node>> {
+        self.paintable.get(self.uv.mesh_idx).copied()
+    }
+
+    pub fn stamp_target_tiles(&self) -> Vec<(u32, Handle<Texture>)> {
         let doc = self.doc();
-        let layer = doc.layers.get(doc.active)?;
-        // Fill has no pixels — the brush always writes the mask.
+        let Some(layer) = doc.layers.get(doc.active) else {
+            return Vec::new();
+        };
         if layer.kind == LayerKind::Fill || doc.paint_target == PaintTarget::Mask {
-            layer.mask
+            layer.mask_tiles(&self.udim_ids)
         } else {
-            layer.tex
+            layer.content_tiles(&self.udim_ids)
         }
+    }
+
+    pub fn stamp_target_tex(&self) -> Option<Handle<Texture>> {
+        self.stamp_target_tiles().first().map(|(_, h)| *h)
     }
 
     pub fn painting_mask(&self) -> bool {
@@ -303,14 +345,29 @@ impl Painter {
             .insert(Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false))
     }
 
+    fn alloc_extra_tiles(&mut self) -> Vec<(u32, Handle<Texture>)> {
+        let ids: Vec<u32> = self.udim_ids.iter().copied().skip(1).collect();
+        ids.into_iter()
+            .map(|id| (id, self.alloc_layer_tex()))
+            .collect()
+    }
+
+    fn alloc_paint_layer(&mut self, name: impl Into<String>) -> crate::paint::Layer {
+        let tex = self.alloc_layer_tex();
+        let extra = self.alloc_extra_tiles();
+        let mut layer = crate::paint::Layer::paint(name, tex);
+        layer.extra_tex = extra;
+        layer
+    }
+
     pub fn add_layer(&mut self) {
         let name = {
             let n = self.doc().layers.len() + 1;
             format!("Layer {n}")
         };
-        let tex = self.alloc_layer_tex();
+        let layer = self.alloc_paint_layer(name);
         let doc = self.doc_mut();
-        doc.layers.push(crate::paint::Layer::paint(name, tex));
+        doc.layers.push(layer);
         doc.active = doc.layers.len() - 1;
         doc.paint_target = PaintTarget::Content;
         doc.mark_dirty();
@@ -353,13 +410,18 @@ impl Painter {
             return;
         }
         let tex = self.alloc_layer_tex();
+        let extra = self.alloc_extra_tiles();
         let doc = self.doc_mut();
         let Some(layer) = doc.layers.get_mut(i) else {
             self.scene.textures.remove(tex);
+            for (_, h) in extra {
+                self.scene.textures.remove(h);
+            }
             return;
         };
         let hide = layer.kind == LayerKind::Fill;
         layer.mask = Some(tex);
+        layer.extra_mask = extra;
         // Fill: black (paint to reveal). Paint: white (keep existing strokes).
         layer.mask_init = Some(if hide {
             [0, 0, 0, 255]
@@ -391,19 +453,23 @@ impl Painter {
 
     fn remove_mask_from_active(&mut self) {
         let active = self.doc().active;
-        let tex = {
+        let (tex, extra) = {
             let doc = self.doc_mut();
             let Some(layer) = doc.layers.get_mut(active) else {
                 return;
             };
             let tex = layer.mask.take();
+            let extra = std::mem::take(&mut layer.extra_mask);
             layer.mask_init = None;
             doc.paint_target = PaintTarget::Content;
             doc.mark_dirty();
-            tex
+            (tex, extra)
         };
         if let Some(tex) = tex {
             self.scene.textures.remove(tex);
+        }
+        for (_, h) in extra {
+            self.scene.textures.remove(h);
         }
     }
 
@@ -462,7 +528,7 @@ impl Painter {
     }
 
     pub fn apply_camera(&mut self) {
-        self.orbit_pitch = self.orbit_pitch.clamp(-1.4, 1.4);
+        self.orbit_pitch = self.orbit_pitch.clamp(-1.55, 1.55);
         self.orbit_dist = self.orbit_dist.clamp(0.02, 80.0);
         self.scene.camera = Camera::orbit(
             self.orbit_yaw,
@@ -472,6 +538,59 @@ impl Painter {
         );
         // Default near is 0.1 — closer than that and the model gets clipped.
         self.scene.camera.near = (self.orbit_dist * 0.05).clamp(0.001, 0.1);
+        if self.ortho_from_view {
+            self.scene.camera.projection = Projection::Orthographic;
+            self.scene.camera.sync_ortho_from_distance();
+        }
+    }
+
+    /// Place the orbit cam on `dir` (world), looking at target. Short tween + ortho.
+    pub fn snap_orbit_to_dir(&mut self, dir: Vec3) {
+        let d = dir.normalize_or_zero();
+        if d.length_squared() < 1e-8 {
+            return;
+        }
+        let to_pitch = d.y.clamp(-1.0, 1.0).asin().clamp(-1.55, 1.55);
+        let to_yaw = d.x.atan2(d.z);
+        self.orbit_snap = Some(OrbitSnap {
+            from_yaw: self.orbit_yaw,
+            from_pitch: self.orbit_pitch,
+            to_yaw,
+            to_pitch,
+            t: 0.0,
+        });
+        self.ortho_from_view = true;
+        self.apply_camera();
+    }
+
+    pub fn tick_orbit_snap(&mut self, dt: f32) {
+        let Some(snap) = self.orbit_snap.as_mut() else {
+            return;
+        };
+        snap.t = (snap.t + dt / 0.22).min(1.0);
+        let t = snap.t;
+        let s = t * t * (3.0 - 2.0 * t);
+        self.orbit_yaw = lerp_angle(snap.from_yaw, snap.to_yaw, s);
+        self.orbit_pitch = snap.from_pitch + (snap.to_pitch - snap.from_pitch) * s;
+        if t >= 1.0 {
+            self.orbit_yaw = snap.to_yaw;
+            self.orbit_pitch = snap.to_pitch;
+            self.orbit_snap = None;
+        }
+        self.apply_camera();
+    }
+
+    pub fn orbit_snap_active(&self) -> bool {
+        self.orbit_snap.is_some()
+    }
+
+    /// Drop an in-flight snap. `restore_perspective` after a free orbit (Blender-style).
+    pub fn interrupt_orbit_snap(&mut self, restore_perspective: bool) {
+        self.orbit_snap = None;
+        if restore_perspective && self.ortho_from_view {
+            self.ortho_from_view = false;
+            self.apply_camera();
+        }
     }
 
     pub fn set_shape(&mut self, shape: usize) {
@@ -498,6 +617,158 @@ impl Painter {
         self.rebuild_bvhs();
         self.segmentation.sync(&self.scene, &self.paintable);
         self.seg_overlay_dirty = true;
+    }
+
+    pub fn unwrap_uv(&mut self) {
+        self.segmentation.sync(&self.scene, &self.paintable);
+        let algo: &dyn UnwrapAlgo = &TriPack;
+        let mut tiles = std::collections::BTreeSet::new();
+        let mut seen = std::collections::HashSet::new();
+        let meshes: Vec<Handle<Mesh>> = self
+            .paintable
+            .iter()
+            .filter_map(|&nh| self.scene.nodes.get(nh)?.mesh)
+            .collect();
+        for mh in meshes {
+            if !seen.insert(mh.key()) {
+                continue;
+            }
+            let Some(mesh) = self.scene.meshes.get(mh) else {
+                continue;
+            };
+            let n = mesh.indices.len() / 3;
+            let face_udim = uv::face_udims(&self.segmentation, mh, n);
+            tiles.extend(face_udim.iter().copied());
+            let Some(mesh) = self.scene.meshes.get_mut(mh) else {
+                continue;
+            };
+            uv::apply_unwrap(mesh, &face_udim, algo);
+        }
+        let mut ids: Vec<u32> = tiles.into_iter().collect();
+        if ids.is_empty() {
+            ids.push(1001);
+        }
+        self.udim_ids = ids;
+        self.rebuild_extra_maps();
+        self.reset_paint_docs();
+        self.bind_paint_maps();
+        self.rebuild_bvhs();
+        self.status = format!(
+            "Unwrapped · {} · {} UDIM",
+            algo.name(),
+            self.udim_ids.len()
+        );
+        self.uv.needs_fit = true;
+    }
+
+    fn reset_udim(&mut self) {
+        self.drop_extra_maps();
+        self.udim_ids = vec![1001];
+    }
+
+    fn drop_extra_maps(&mut self) {
+        let extra: Vec<_> = self
+            .extra_albedo
+            .drain(..)
+            .chain(self.extra_mr.drain(..))
+            .chain(self.extra_nrm.drain(..))
+            .collect();
+        for (_, h) in extra {
+            self.scene.textures.remove(h);
+        }
+    }
+
+    fn rebuild_extra_maps(&mut self) {
+        self.drop_extra_maps();
+        let rough = 0.45;
+        let rough_u8 = (rough * 255.0) as u8;
+        for &id in self.udim_ids.iter().skip(1) {
+            let mut albedo = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, true);
+            fill_rgba(&mut albedo.rgba, 220, 220, 225, 255);
+            self.extra_albedo
+                .push((id, self.scene.textures.insert(albedo)));
+
+            let mut mr = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false);
+            for px in mr.rgba.chunks_exact_mut(4) {
+                px[0] = 255;
+                px[1] = rough_u8;
+                px[2] = 0;
+                px[3] = 255;
+            }
+            self.extra_mr.push((id, self.scene.textures.insert(mr)));
+
+            let mut nrm = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false);
+            fill_rgba(&mut nrm.rgba, 128, 128, 255, 255);
+            self.extra_nrm.push((id, self.scene.textures.insert(nrm)));
+        }
+    }
+
+    fn paint_maps(&self) -> MaterialMaps {
+        if self.udim_ids.len() <= 1 {
+            return MaterialMaps::Single {
+                albedo: Some(self.albedo_tex),
+                normal: Some(self.nrm_tex),
+                metallic_roughness: Some(self.mr_tex),
+            };
+        }
+        let id0 = self.udim_ids[0];
+        let mut albedo = vec![(id0, self.albedo_tex)];
+        albedo.extend(self.extra_albedo.iter().copied());
+        let mut normal = vec![(id0, self.nrm_tex)];
+        normal.extend(self.extra_nrm.iter().copied());
+        let mut metallic_roughness = vec![(id0, self.mr_tex)];
+        metallic_roughness.extend(self.extra_mr.iter().copied());
+        MaterialMaps::Udim {
+            albedo,
+            normal,
+            metallic_roughness,
+        }
+    }
+
+    fn bind_paint_maps(&mut self) {
+        let maps = self.paint_maps();
+        let mut handles = vec![self.paint_mat];
+        for &nh in &self.paintable {
+            if let Some(m) = self.scene.nodes.get(nh).and_then(|n| n.material) {
+                handles.push(m);
+            }
+        }
+        handles.sort_by_key(|h| h.key());
+        handles.dedup_by_key(|h| h.key());
+        for h in handles {
+            if let Some(mat) = self.scene.materials.get_mut(h) {
+                mat.maps = maps.clone();
+            }
+        }
+    }
+
+    pub fn material_map_tiles(&self, map: PaintMap) -> Vec<(u32, Handle<Texture>)> {
+        let id0 = *self.udim_ids.first().unwrap_or(&1001);
+        match map {
+            PaintMap::Albedo => {
+                let mut v = vec![(id0, self.albedo_tex)];
+                v.extend(self.extra_albedo.iter().copied());
+                v
+            }
+            PaintMap::Metallic | PaintMap::Roughness => {
+                let mut v = vec![(id0, self.mr_tex)];
+                v.extend(self.extra_mr.iter().copied());
+                v
+            }
+            PaintMap::Normal => {
+                let mut v = vec![(id0, self.nrm_tex)];
+                v.extend(self.extra_nrm.iter().copied());
+                v
+            }
+        }
+    }
+
+    pub fn dst_map_handles(&self) -> Vec<Handle<Texture>> {
+        let mut v = vec![self.albedo_tex, self.mr_tex, self.nrm_tex];
+        v.extend(self.extra_albedo.iter().map(|(_, h)| *h));
+        v.extend(self.extra_mr.iter().map(|(_, h)| *h));
+        v.extend(self.extra_nrm.iter().map(|(_, h)| *h));
+        v
     }
 
     fn rebuild_bvhs(&mut self) {
@@ -533,6 +804,8 @@ impl Painter {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
                 self.model_name = name.clone();
+                self.uv.needs_fit = true;
+                self.uv.needs_fit = true;
                 if !self.status.starts_with("BVH") {
                     self.status = format!("Loaded {name}");
                 } else {
@@ -553,6 +826,7 @@ impl Painter {
         let root = load_gltf(&mut self.scene, path, Some(self.root))?;
         self.model_root = Some(root);
 
+        self.reset_udim();
         let mesh_nodes = collect_mesh_nodes(&self.scene, Some(root));
         let mut touched = std::collections::HashSet::new();
         for &h in &mesh_nodes {
@@ -571,13 +845,12 @@ impl Painter {
             if !touched.insert(mat_h.key()) {
                 continue;
             }
+            let maps = self.paint_maps();
             if let Some(mat) = self.scene.materials.get_mut(mat_h) {
                 mat.albedo = [1.0, 1.0, 1.0, 1.0];
-                mat.albedo_map = Some(self.albedo_tex);
                 mat.metallic = 1.0;
                 mat.roughness = 1.0;
-                mat.metallic_roughness_map = Some(self.mr_tex);
-                mat.normal_map = Some(self.nrm_tex);
+                mat.maps = maps;
             }
         }
 
@@ -611,13 +884,8 @@ impl Painter {
             PaintDocument::new(TEX_SIZE, TEX_SIZE, FLAT_NORMAL),
         ];
         for i in 0..self.docs.len() {
-            let tex = self
-                .scene
-                .textures
-                .insert(Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false));
-            self.docs[i]
-                .layers
-                .push(crate::paint::Layer::paint("Layer 1", tex));
+            let layer = self.alloc_paint_layer("Layer 1");
+            self.docs[i].layers.push(layer);
             self.docs[i].active = 0;
             self.docs[i].mark_dirty();
         }
@@ -637,26 +905,27 @@ impl Painter {
         if let Some(tex) = self.scene.textures.get_mut(self.nrm_tex) {
             fill_rgba(&mut tex.rgba, 128, 128, 255, 255);
         }
+        for (_, h) in &self.extra_albedo {
+            if let Some(tex) = self.scene.textures.get_mut(*h) {
+                fill_rgba(&mut tex.rgba, 220, 220, 225, 255);
+            }
+        }
+        for (_, h) in &self.extra_mr {
+            if let Some(tex) = self.scene.textures.get_mut(*h) {
+                for px in tex.rgba.chunks_exact_mut(4) {
+                    px[0] = 255;
+                    px[1] = rough_u8;
+                    px[2] = 0;
+                    px[3] = 255;
+                }
+            }
+        }
+        for (_, h) in &self.extra_nrm {
+            if let Some(tex) = self.scene.textures.get_mut(*h) {
+                fill_rgba(&mut tex.rgba, 128, 128, 255, 255);
+            }
+        }
         self.needs_map_seed = true;
-    }
-
-    /// Upload albedo/MR CPU bases into GPU (call after visualizer.sync).
-    pub fn seed_map_pixels(
-        &self,
-        queue: &wgpu::Queue,
-        albedo: &wgpu::Texture,
-        mr: &wgpu::Texture,
-        nrm: &wgpu::Texture,
-    ) {
-        if let Some(cpu) = self.scene.textures.get(self.albedo_tex) {
-            crate::gpu_paint::write_paint_rgba(queue, albedo, &cpu.rgba, cpu.width, cpu.height);
-        }
-        if let Some(cpu) = self.scene.textures.get(self.mr_tex) {
-            crate::gpu_paint::write_paint_rgba(queue, mr, &cpu.rgba, cpu.width, cpu.height);
-        }
-        if let Some(cpu) = self.scene.textures.get(self.nrm_tex) {
-            crate::gpu_paint::write_paint_rgba(queue, nrm, &cpu.rgba, cpu.width, cpu.height);
-        }
     }
 
     fn fit_to_nodes(&mut self, nodes: &[Handle<Node>]) {
@@ -785,8 +1054,7 @@ impl Painter {
     fn pick_hit(&mut self, screen: Vec2, viewport: Rect) -> Option<pick::Hit> {
         let aspect = (self.viewport_size.x / self.viewport_size.y.max(1.0)).max(1e-4);
         let view_proj = self.scene.camera.view_proj(aspect);
-        let (origin, dir) =
-            pick::screen_ray(screen, viewport, self.scene.camera.eye, view_proj.inverse());
+        let (origin, dir) = pick::screen_ray(screen, viewport, view_proj.inverse());
         pick::ensure_bvhs(&self.scene, &self.paintable, &mut self.bvh_cache);
         pick::pick_mesh(
             &self.scene,
@@ -904,6 +1172,9 @@ impl Painter {
             let Some(n) = self.scene.nodes.get(nh) else {
                 continue;
             };
+            if !n.visible {
+                continue;
+            }
             let Some(mh) = n.mesh else {
                 continue;
             };
@@ -941,6 +1212,33 @@ impl Painter {
         }
     }
 
+    fn view_gizmo_cursor(&self, screen: Vec2, viewport: Rect) -> (Vec2, Vec2) {
+        let hud_size = Vec2::new(
+            self.viewport_size.x.round().max(1.0),
+            self.viewport_size.y.round().max(1.0),
+        );
+        let local = crate::gpu_paint::cursor_to_map_px(
+            screen,
+            viewport,
+            hud_size.x as u32,
+            hud_size.y as u32,
+        );
+        (hud_size, local)
+    }
+
+    pub fn over_view_gizmo(&self, screen: Vec2, viewport: Rect) -> bool {
+        if viewport.width() <= 1.0 || !viewport.contains(screen) {
+            return false;
+        }
+        let (size, local) = self.view_gizmo_cursor(screen, viewport);
+        view_gizmo::contains_cursor(size, local)
+    }
+
+    pub fn pick_view_gizmo(&self, screen: Vec2, viewport: Rect) -> Option<view_gizmo::ViewAxis> {
+        let (size, local) = self.view_gizmo_cursor(screen, viewport);
+        view_gizmo::hit_test(&self.scene.camera, size, local)
+    }
+
     /// Brush cursor into `scene.hud` (viewport pixel space, drawn with the scene).
     pub fn update_brush_cursor(&mut self, screen: Vec2, viewport: Rect, show: bool) {
         let hud_size = Vec2::new(
@@ -957,7 +1255,12 @@ impl Painter {
             ..Default::default()
         };
         self.scene.hud.begin(&input, hud_size);
-        if show {
+        let local = input.cursor;
+        if viewport.width() > 1.0 && viewport.height() > 1.0 {
+            view_gizmo::draw(&mut self.scene.hud, &self.scene.camera, hud_size, local);
+        }
+        let over_gizmo = view_gizmo::contains_cursor(hud_size, local);
+        if show && !over_gizmo {
             if self.mode == AppMode::Segment {
                 self.draw_segment_cursor(screen, viewport, hud_size);
             } else {
@@ -1031,12 +1334,7 @@ impl Painter {
 
         let aspect = hud_size.x / hud_size.y.max(1.0);
         let view_proj = self.scene.camera.view_proj(aspect);
-        let (origin, dir) = pick::screen_ray(
-            screen,
-            viewport,
-            self.scene.camera.eye,
-            view_proj.inverse(),
-        );
+        let (origin, dir) = pick::screen_ray(screen, viewport, view_proj.inverse());
         pick::ensure_bvhs(&self.scene, &self.paintable, &mut self.bvh_cache);
         let hit = pick::pick_mesh(
             &self.scene,
@@ -1097,6 +1395,7 @@ impl Painter {
     }
 
     pub fn pan_camera(&mut self, dx: f32, dy: f32) {
+        self.interrupt_orbit_snap(false);
         let eye = self.scene.camera.eye;
         let f = (self.orbit_target - eye).normalize_or_zero();
         let mut r = Vec3::Y.cross(f).normalize_or_zero();
@@ -1109,6 +1408,17 @@ impl Painter {
         self.orbit_target += r * (-dx * scale) + u * (dy * scale);
         self.apply_camera();
     }
+}
+
+fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
+    let mut d = b - a;
+    while d > std::f32::consts::PI {
+        d -= TAU;
+    }
+    while d < -std::f32::consts::PI {
+        d += TAU;
+    }
+    a + d * t
 }
 
 fn fill_rgba(buf: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
@@ -1130,7 +1440,7 @@ fn collect_mesh_nodes(scene: &Scene, root: Option<Handle<Node>>) -> Vec<Handle<N
         let Some(node) = scene.nodes.get(h) else {
             continue;
         };
-        if node.mesh.is_some() && node.visible {
+        if node.mesh.is_some() {
             out.push(h);
         }
         for (child, n) in scene.nodes.iter() {

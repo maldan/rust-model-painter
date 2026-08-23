@@ -1,11 +1,12 @@
 use glam::Vec2;
-use mega_render::{DebugView, Light, Scene};
+use mega_render::{DebugView, Handle, Light, Node, Scene};
 use mega_ui::{ScrollAxes, TextStyle, Ui};
 
 use crate::brush_alpha::{ALPHA_TEX_BASE, NRM_TEX_BASE};
 use crate::paint::{luma, Brush, LayerKind, PaintDocument, PaintMap, PaintTarget, PaintTool};
 use crate::segment::{AppMode, SegOp, SegTool, Segmentation};
-use super::{post_ui, Painter, SCENE_TEX};
+use super::{post_ui, Painter, SCENE_TEX, UV_TEX};
+use crate::uv_view::UvView;
 
 const VIEW_MODES: &[DebugView] = &[
     DebugView::Final,
@@ -39,6 +40,7 @@ struct Actions {
     rect_through: bool,
     add_segment: bool,
     del_segment: bool,
+    unwrap_uv: bool,
     seg_overlay: bool,
     active_alpha: usize,
     active_nrm: usize,
@@ -76,6 +78,7 @@ impl Painter {
             rect_through: self.rect_through,
             add_segment: false,
             del_segment: false,
+            unwrap_uv: false,
             seg_overlay: false,
             active_alpha: self.active_alpha,
             active_nrm: self.active_nrm,
@@ -90,10 +93,13 @@ impl Painter {
             let model_name = self.model_name.as_str();
             let scene = &mut self.scene;
             let segmentation = &mut self.segmentation;
+            let mesh_nodes = self.paintable.clone();
+            let uv = &mut self.uv;
 
             ui.dock_space("main", dock_size, dock, |ui, tab| match tab {
                 "Alphas" => alphas_panel(ui, &mut a, docs, &alpha_names, &nrm_names),
                 "Viewport" => viewport_panel(ui, &mut a, docs, viewport_size),
+                "UV" => uv_panel(ui, &mut a, docs, scene, &mesh_nodes, uv),
                 "Brush" => brush_panel(ui, &mut a, docs, brush, model_name, has_model),
                 "Lights" => lights_panel(ui, &mut a, scene),
                 "Effects" => {
@@ -103,6 +109,7 @@ impl Painter {
                 }
                 "Layers" => layers_panel(ui, &mut a, docs),
                 "Segments" => segments_panel(ui, &mut a, segmentation),
+                "Meshes" => meshes_panel(ui, &mut a, scene, &mesh_nodes),
                 _ => {}
             });
         }
@@ -148,6 +155,10 @@ fn apply_actions(painter: &mut Painter, a: Actions) -> bool {
     if a.del_segment {
         painter.segmentation.remove_active();
         painter.seg_overlay_dirty = true;
+        keep = true;
+    }
+    if a.unwrap_uv {
+        painter.unwrap_uv();
         keep = true;
     }
     if a.seg_overlay {
@@ -301,6 +312,60 @@ fn viewport_panel(
     let size = ui.available_size();
     *viewport_size = size;
     ui.texture(SCENE_TEX, size);
+}
+
+fn uv_panel(
+    ui: &mut Ui,
+    a: &mut Actions,
+    docs: &mut [PaintDocument; 4],
+    scene: &Scene,
+    nodes: &[Handle<Node>],
+    uv: &mut UvView,
+) {
+    let names: Vec<String> = nodes
+        .iter()
+        .map(|&h| {
+            scene
+                .nodes
+                .get(h)
+                .map(|n| {
+                    if n.name.is_empty() {
+                        let k = h.key();
+                        format!("Mesh {}/{}", k.0, k.1)
+                    } else {
+                        n.name.clone()
+                    }
+                })
+                .unwrap_or_else(|| "Mesh".into())
+        })
+        .collect();
+    let map_labels: Vec<&str> = PaintMap::ALL.iter().map(|m| m.label()).collect();
+    ui.row(|ui| {
+        if names.is_empty() {
+            ui.label("No meshes");
+        } else {
+            let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            let mut idx = uv.mesh_idx.min(names.len() - 1);
+            uv.mesh_idx = idx;
+            if ui.select("uv_mesh", &mut idx, &name_refs).changed() {
+                uv.mesh_idx = idx;
+                a.keep = true;
+            }
+        }
+        let mut map_idx = a.paint_map.index();
+        if ui.select("uv_paint_map", &mut map_idx, &map_labels).changed() {
+            a.paint_map = PaintMap::ALL[map_idx];
+            a.active = docs[a.paint_map.index()].active;
+            a.keep = true;
+        }
+        if ui.checkbox("Show UV", &mut uv.show_uv).changed() {
+            a.keep = true;
+        }
+    });
+    ui.separator();
+    let size = ui.available_size();
+    uv.size = size;
+    ui.texture(UV_TEX, size);
 }
 
 fn brush_panel(
@@ -629,6 +694,10 @@ fn segments_panel(ui: &mut Ui, a: &mut Actions, segmentation: &mut Segmentation)
             a.keep = true;
         }
     });
+    if ui.button("Unwrap UV").clicked() {
+        a.unwrap_uv = true;
+        a.keep = true;
+    }
     ui.label("Color is viewport only · one triangle, one segment");
     ui.separator();
     let active = segmentation.active;
@@ -663,6 +732,47 @@ fn segments_panel(ui: &mut Ui, a: &mut Actions, segmentation: &mut Segmentation)
                 segmentation.active = Some(id);
                 a.keep = true;
             }
+        }
+    });
+}
+
+fn meshes_panel(ui: &mut Ui, a: &mut Actions, scene: &mut Scene, nodes: &[Handle<Node>]) {
+    ui.label("Meshes");
+    ui.separator();
+    if nodes.is_empty() {
+        ui.label("No meshes");
+        return;
+    }
+    let size = ui.available_size();
+    ui.scroll_area("meshes", size, ScrollAxes::Vertical, |ui| {
+        for &h in nodes {
+            let key = h.key();
+            let (visible, name) = {
+                let Some(node) = scene.nodes.get(h) else {
+                    continue;
+                };
+                let name = if node.name.is_empty() {
+                    format!("Mesh {}/{}", key.0, key.1)
+                } else {
+                    node.name.clone()
+                };
+                (node.visible, name)
+            };
+            ui.row(|ui| {
+                let eye = if visible {
+                    "visibility"
+                } else {
+                    "visibility_off"
+                };
+                if ui.icon_button(&format!("mesh_vis{}_{}", key.0, key.1), eye, visible) {
+                    if let Some(n) = scene.nodes.get_mut(h) {
+                        n.visible = !n.visible;
+                    }
+                    a.seg_overlay = true;
+                    a.keep = true;
+                }
+                ui.label(&name);
+            });
         }
     });
 }

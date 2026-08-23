@@ -23,15 +23,19 @@ pub struct Hit {
 
 pub type BvhCache = HashMap<(u32, u32), MeshBvh>;
 
-pub fn screen_ray(screen: Vec2, viewport: Rect, cam_eye: Vec3, view_proj_inv: Mat4) -> (Vec3, Vec3) {
+/// World ray through a viewport pixel. Origin is the unprojected *near* plane
+/// (not the camera eye) so orthographic views keep parallel rays.
+pub fn screen_ray(screen: Vec2, viewport: Rect, view_proj_inv: Mat4) -> (Vec3, Vec3) {
     let w = viewport.width().max(1.0);
     let h = viewport.height().max(1.0);
     let u = ((screen.x - viewport.min.x) / w).clamp(0.0, 1.0);
     let v = ((screen.y - viewport.min.y) / h).clamp(0.0, 1.0);
-    let ndc = Vec3::new(u * 2.0 - 1.0, 1.0 - v * 2.0, 1.0);
-    let far = view_proj_inv.project_point3(ndc);
-    let dir = (far - cam_eye).normalize_or_zero();
-    (cam_eye, dir)
+    let x = u * 2.0 - 1.0;
+    let y = 1.0 - v * 2.0;
+    let near = view_proj_inv.project_point3(Vec3::new(x, y, 0.0));
+    let far = view_proj_inv.project_point3(Vec3::new(x, y, 1.0));
+    let dir = (far - near).normalize_or_zero();
+    (near, dir)
 }
 
 /// Ensure BVHs exist for every mesh referenced by `paintable` nodes.

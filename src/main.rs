@@ -5,11 +5,13 @@ mod gpu_paint;
 mod paint;
 mod pick;
 mod segment;
+mod uv;
+mod uv_view;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use app::{Painter, SCENE_TEX};
+use app::{Painter, SCENE_TEX, UV_TEX};
 use brush_alpha::{ALPHA_TEX_BASE, NRM_TEX_BASE};
 use glam::Vec2;
 use gpu_paint::{cursor_to_map_px, write_paint_rgba, CompositeLayer, GpuPaint};
@@ -18,6 +20,7 @@ use mega_ui::wgpu::UiRenderer;
 use mega_ui::{CursorIcon, Ui, UiInput};
 use paint::{luma, LayerKind, PaintMap, PaintTool, TEX_SIZE};
 use pick::find_viewport_rect;
+use uv_view::UvPreview;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -50,6 +53,48 @@ impl SceneTarget {
         });
         let render_view = texture.create_view(&Default::default());
         ui.bind_texture_view(device, SCENE_TEX, texture.create_view(&Default::default()));
+        Self {
+            _texture: texture,
+            render_view,
+            size: (w, h),
+        }
+    }
+
+    fn resize(&mut self, device: &wgpu::Device, ui: &mut UiRenderer, w: u32, h: u32) {
+        let w = w.max(1);
+        let h = h.max(1);
+        if self.size == (w, h) {
+            return;
+        }
+        *self = Self::ensure(device, ui, (w, h));
+    }
+}
+
+struct UvTarget {
+    _texture: wgpu::Texture,
+    render_view: wgpu::TextureView,
+    size: (u32, u32),
+}
+
+impl UvTarget {
+    fn ensure(device: &wgpu::Device, ui: &mut UiRenderer, size: (u32, u32)) -> Self {
+        let (w, h) = (size.0.max(1), size.1.max(1));
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("painter uv color"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let render_view = texture.create_view(&Default::default());
+        ui.bind_texture_view(device, UV_TEX, texture.create_view(&Default::default()));
         Self {
             _texture: texture,
             render_view,
@@ -175,7 +220,9 @@ struct Gpu {
     visualizer: WgpuVisualizer,
     ui_renderer: UiRenderer,
     scene_target: SceneTarget,
+    uv_target: UvTarget,
     gpu_paint: GpuPaint,
+    uv_preview: UvPreview,
 }
 
 struct Host {
@@ -194,7 +241,9 @@ struct Host {
     want_capture_mouse: bool,
     looking: bool,
     panning: bool,
+    uv_panning: bool,
     last_viewport_rect: Option<mega_ui::Rect>,
+    last_uv_rect: Option<mega_ui::Rect>,
 }
 
 impl Host {
@@ -217,7 +266,9 @@ impl Host {
             want_capture_mouse: false,
             looking: false,
             panning: false,
+            uv_panning: false,
             last_viewport_rect: None,
+            last_uv_rect: None,
         }
     }
 
@@ -226,6 +277,9 @@ impl Host {
             return;
         }
         self.looking = looking;
+        if looking {
+            self.painter.interrupt_orbit_snap(true);
+        }
         let Some(window) = &self.window else {
             return;
         };
@@ -312,9 +366,16 @@ impl Host {
         let mut ui_renderer = UiRenderer::new(&device, &queue, format, &self.ui);
         ui_renderer.set_viewport(&queue, width as f32, height as f32);
         let scene_target = SceneTarget::ensure(&device, &mut ui_renderer, vp);
+        let uv_size = (
+            self.painter.uv.size.x.max(1.0) as u32,
+            self.painter.uv.size.y.max(1.0) as u32,
+        );
+        let uv_target = UvTarget::ensure(&device, &mut ui_renderer, uv_size);
         let mut gpu_paint = GpuPaint::new(&device);
         gpu_paint.upload_alphas(&device, &queue, &self.painter.alphas);
         gpu_paint.upload_normals(&device, &queue, &self.painter.nrm_stamps);
+        let uv_preview = UvPreview::new(&device);
+        uv_preview.seed_white(&queue);
         for (i, view) in gpu_paint.alpha_views().iter().enumerate() {
             ui_renderer.bind_texture_view(
                 &device,
@@ -338,7 +399,9 @@ impl Host {
             visualizer,
             ui_renderer,
             scene_target,
+            uv_target,
             gpu_paint,
+            uv_preview,
         });
         self.window = Some(window);
     }
@@ -397,18 +460,32 @@ impl Host {
             self.fps_frames = 0;
         }
 
-        // Orbit camera while RMB look
         if self.looking {
             const SENS: f32 = 0.005;
             self.painter.orbit_yaw += self.input.look_delta.x * SENS;
             self.painter.orbit_pitch += self.input.look_delta.y * SENS;
             self.painter.apply_camera();
+        } else if self.uv_panning {
+            self.painter
+                .uv
+                .pan_px(self.input.look_delta.x, self.input.look_delta.y);
+        } else {
+            self.painter.tick_orbit_snap(dt);
         }
         if self.panning {
             self.painter
                 .pan_camera(self.input.look_delta.x, self.input.look_delta.y);
         }
-        if self.input.scroll_delta.y.abs() > 0.0
+        let over_uv = self
+            .last_uv_rect
+            .is_some_and(|r| r.contains(self.input.mouse_pos));
+        if self.input.scroll_delta.y.abs() > 0.0 && over_uv {
+            if let Some(rect) = self.last_uv_rect {
+                let local = self.input.mouse_pos - rect.min;
+                let factor = (1.0 - self.input.scroll_delta.y * 0.0015).clamp(0.5, 2.0);
+                self.painter.uv.zoom_at(factor, local);
+            }
+        } else if self.input.scroll_delta.y.abs() > 0.0
             && self
                 .last_viewport_rect
                 .is_some_and(|r| r.contains(self.input.mouse_pos))
@@ -419,7 +496,11 @@ impl Host {
         }
 
         let viewport = Vec2::new(size.width as f32, size.height as f32);
-        let ui_input = if self.looking || self.panning {
+        let ui_input = if self.looking
+            || self.panning
+            || self.uv_panning
+            || self.painter.orbit_snap_active()
+        {
             let mut starved = self.input.to_ui(viewport, dt);
             starved.mouse_down = false;
             starved.mouse_pressed = false;
@@ -444,16 +525,25 @@ impl Host {
         let out = self.ui.end_frame();
         self.want_capture_mouse = out.want_capture_mouse;
         self.last_viewport_rect = find_viewport_rect(&out.draw_list, SCENE_TEX);
+        self.last_uv_rect = find_viewport_rect(&out.draw_list, UV_TEX);
 
-        // Paint
-        if !self.looking && !self.panning {
+        // Paint / view-gizmo snap
+        if !self.looking && !self.panning && !self.uv_panning {
             if let Some(rect) = self.last_viewport_rect {
                 let over = rect.contains(mouse_pos);
+                let over_gizmo = over && self.painter.over_view_gizmo(mouse_pos, rect);
                 if mouse_pressed && over && !out.want_capture_mouse {
-                    self.painter.painting = true;
-                    self.painter.begin_stroke();
-                    self.painter.viewport_interact(mouse_pos, rect);
-                } else if self.painter.painting && mouse_down && over {
+                    if over_gizmo {
+                        if let Some(axis) = self.painter.pick_view_gizmo(mouse_pos, rect) {
+                            self.painter.snap_orbit_to_dir(axis.dir());
+                            self.painter.status = format!("View {} · ortho", axis.label());
+                        }
+                    } else {
+                        self.painter.painting = true;
+                        self.painter.begin_stroke();
+                        self.painter.viewport_interact(mouse_pos, rect);
+                    }
+                } else if self.painter.painting && mouse_down && over && !over_gizmo {
                     self.painter.viewport_interact(mouse_pos, rect);
                 }
                 if mouse_released || !mouse_down {
@@ -470,7 +560,9 @@ impl Host {
         self.animating = keep_ui
             || self.looking
             || self.panning
+            || self.uv_panning
             || self.painter.painting
+            || self.painter.orbit_snap_active()
             || out.needs_repaint
             || needs_composite;
 
@@ -482,6 +574,7 @@ impl Host {
         let show = self.last_viewport_rect.is_some()
             && !self.looking
             && !self.panning
+            && !self.uv_panning
             && !out.want_capture_mouse
             && vp_rect.contains(mouse_pos);
         self.painter
@@ -514,11 +607,23 @@ impl Host {
             // gpu_resident maps keep GPU as source of truth — force a clean base upload
             // after create/load so the first frame isn't uninitialized garbage.
             if self.painter.needs_map_seed {
-                let albedo = gpu.visualizer.texture_gpu(self.painter.albedo_tex).cloned();
-                let mr = gpu.visualizer.texture_gpu(self.painter.mr_tex).cloned();
-                let nrm = gpu.visualizer.texture_gpu(self.painter.nrm_tex).cloned();
-                if let (Some(albedo), Some(mr), Some(nrm)) = (albedo, mr, nrm) {
-                    self.painter.seed_map_pixels(&gpu.queue, &albedo, &mr, &nrm);
+                let handles = self.painter.dst_map_handles();
+                let mut ready = true;
+                for h in &handles {
+                    if gpu.visualizer.texture_gpu(*h).is_none() {
+                        ready = false;
+                        break;
+                    }
+                }
+                if ready {
+                    for h in handles {
+                        let Some(gpu_tex) = gpu.visualizer.texture_gpu(h).cloned() else {
+                            continue;
+                        };
+                        if let Some(cpu) = self.painter.scene.textures.get(h) {
+                            write_paint_rgba(&gpu.queue, &gpu_tex, &cpu.rgba, cpu.width, cpu.height);
+                        }
+                    }
                     self.painter.needs_map_seed = false;
                     for doc in &mut self.painter.docs {
                         doc.mark_dirty();
@@ -530,35 +635,51 @@ impl Host {
             for doc in &mut self.painter.docs {
                 for layer in &mut doc.layers {
                     if layer.needs_clear {
-                        if let Some(h) = layer.tex {
-                            let Some(tex) = gpu.visualizer.texture_gpu(h).cloned() else {
-                                doc.composite_dirty = true;
-                                continue;
-                            };
-                            gpu.gpu_paint.clear_texture(&gpu.queue, &tex, (TEX_SIZE, TEX_SIZE));
+                        let tiles = layer.content_tiles(&self.painter.udim_ids);
+                        if tiles.is_empty() {
                             layer.needs_clear = false;
-                            doc.composite_dirty = true;
                         } else {
-                            layer.needs_clear = false;
+                            let mut ok = true;
+                            for (_, h) in &tiles {
+                                let Some(tex) = gpu.visualizer.texture_gpu(*h).cloned() else {
+                                    ok = false;
+                                    break;
+                                };
+                                gpu.gpu_paint.clear_texture(&gpu.queue, &tex, (TEX_SIZE, TEX_SIZE));
+                            }
+                            if ok {
+                                layer.needs_clear = false;
+                                doc.composite_dirty = true;
+                            } else {
+                                doc.composite_dirty = true;
+                            }
                         }
                     }
                     if layer.mask_init.is_some() {
-                        if let Some(h) = layer.mask {
-                            let Some(tex) = gpu.visualizer.texture_gpu(h).cloned() else {
-                                doc.composite_dirty = true;
-                                continue;
-                            };
-                            let rgba = layer.mask_init.unwrap_or([255, 255, 255, 255]);
-                            gpu.gpu_paint.fill_texture(
-                                &gpu.queue,
-                                &tex,
-                                (TEX_SIZE, TEX_SIZE),
-                                rgba,
-                            );
+                        let tiles = layer.mask_tiles(&self.painter.udim_ids);
+                        if tiles.is_empty() {
                             layer.mask_init = None;
-                            doc.composite_dirty = true;
                         } else {
-                            layer.mask_init = None;
+                            let rgba = layer.mask_init.unwrap_or([255, 255, 255, 255]);
+                            let mut ok = true;
+                            for (_, h) in &tiles {
+                                let Some(tex) = gpu.visualizer.texture_gpu(*h).cloned() else {
+                                    ok = false;
+                                    break;
+                                };
+                                gpu.gpu_paint.fill_texture(
+                                    &gpu.queue,
+                                    &tex,
+                                    (TEX_SIZE, TEX_SIZE),
+                                    rgba,
+                                );
+                            }
+                            if ok {
+                                layer.mask_init = None;
+                                doc.composite_dirty = true;
+                            } else {
+                                doc.composite_dirty = true;
+                            }
                         }
                     }
                 }
@@ -585,8 +706,8 @@ impl Host {
                 );
 
                 // Stamp into the active paint layer or its mask — never into the material composite.
-                if let Some(layer_h) = self.painter.stamp_target_tex() {
-                    let paint_tex = gpu.visualizer.texture_gpu(layer_h).cloned();
+                let stamp_tiles = self.painter.stamp_target_tiles();
+                if !stamp_tiles.is_empty() {
                     let stamp_brush = self.painter.stamp_brush();
                     let erase = self.painter.tool == PaintTool::Eraser;
                     let nrm_stamp = self.painter.paint_map == PaintMap::Normal
@@ -602,7 +723,11 @@ impl Host {
                                 .is_some_and(|a| a.coverage_stamp),
                         )
                     };
-                    if let Some(paint_tex) = paint_tex {
+                    for &(udim, layer_h) in &stamp_tiles {
+                        let Some(paint_tex) = gpu.visualizer.texture_gpu(layer_h).cloned() else {
+                            continue;
+                        };
+                        let tile = crate::uv::udim_origin(udim);
                         for stamp in &stamps {
                             let center = cursor_to_map_px(stamp.screen, stamp.viewport, vp_w, vp_h);
                             let screen_r = (stamp.screen_radius_px * 2.0).max(4.0);
@@ -622,6 +747,7 @@ impl Host {
                                 stamp.plane_normal,
                                 coverage_stamp,
                                 nrm_stamp,
+                                tile,
                             );
                         }
                         did_stamp = true;
@@ -639,8 +765,11 @@ impl Host {
             {
                 self.painter.docs[PaintMap::Metallic.index()].mark_dirty();
                 self.painter.docs[PaintMap::Roughness.index()].mark_dirty();
-                if let Some(mr) = gpu.visualizer.texture_gpu(self.painter.mr_tex).cloned() {
-                    if let Some(cpu) = self.painter.scene.textures.get(self.painter.mr_tex) {
+                for (_, h) in self.painter.material_map_tiles(PaintMap::Metallic) {
+                    let Some(mr) = gpu.visualizer.texture_gpu(h).cloned() else {
+                        continue;
+                    };
+                    if let Some(cpu) = self.painter.scene.textures.get(h) {
                         write_paint_rgba(&gpu.queue, &mr, &cpu.rgba, cpu.width, cpu.height);
                     }
                 }
@@ -658,115 +787,160 @@ impl Host {
                 .collect();
             for map in dirty_maps {
                 let _ = self.painter.docs[map.index()].take_composite_dirty();
-                let dst_h = match map {
-                    PaintMap::Albedo => self.painter.albedo_tex,
-                    PaintMap::Metallic | PaintMap::Roughness => self.painter.mr_tex,
-                    PaintMap::Normal => self.painter.nrm_tex,
-                };
-                let Some(dst) = gpu.visualizer.texture_gpu(dst_h).cloned() else {
+                let dst_tiles = self.painter.material_map_tiles(map);
+                if dst_tiles.is_empty() {
                     self.painter.docs[map.index()].mark_dirty();
                     continue;
-                };
+                }
 
-                // Collect layer GPU textures (bottom → top). Missing / uncleared → base-only, retry later.
-                let mut owned: Vec<(f32, u32, [f32; 4], Option<wgpu::Texture>, Option<wgpu::Texture>)> =
-                    Vec::new();
-                let mut layers_ready = true;
-                for layer in self.painter.docs[map.index()]
-                    .layers
-                    .iter()
-                    .filter(|l| l.visible && l.opacity > 0.001)
-                {
-                    if layer.needs_clear || layer.mask_init.is_some() {
-                        layers_ready = false;
-                        break;
-                    }
-                    let content = match layer.kind {
-                        LayerKind::Paint => {
-                            let Some(h) = layer.tex else {
-                                layers_ready = false;
-                                break;
-                            };
+                let mut any_missing_dst = false;
+                for &(udim, dst_h) in &dst_tiles {
+                    let Some(dst) = gpu.visualizer.texture_gpu(dst_h).cloned() else {
+                        any_missing_dst = true;
+                        continue;
+                    };
+
+                    let mut owned: Vec<(
+                        f32,
+                        u32,
+                        [f32; 4],
+                        Option<wgpu::Texture>,
+                        Option<wgpu::Texture>,
+                    )> = Vec::new();
+                    let mut layers_ready = true;
+                    for layer in self.painter.docs[map.index()]
+                        .layers
+                        .iter()
+                        .filter(|l| l.visible && l.opacity > 0.001)
+                    {
+                        if layer.needs_clear || layer.mask_init.is_some() {
+                            layers_ready = false;
+                            break;
+                        }
+                        let content = match layer.kind {
+                            LayerKind::Paint => {
+                                let Some((_, h)) = layer
+                                    .content_tiles(&self.painter.udim_ids)
+                                    .into_iter()
+                                    .find(|(id, _)| *id == udim)
+                                else {
+                                    layers_ready = false;
+                                    break;
+                                };
+                                let Some(t) = gpu.visualizer.texture_gpu(h).cloned() else {
+                                    layers_ready = false;
+                                    break;
+                                };
+                                Some(t)
+                            }
+                            LayerKind::Fill => None,
+                        };
+                        let mask = if let Some((_, h)) = layer
+                            .mask_tiles(&self.painter.udim_ids)
+                            .into_iter()
+                            .find(|(id, _)| *id == udim)
+                        {
                             let Some(t) = gpu.visualizer.texture_gpu(h).cloned() else {
                                 layers_ready = false;
                                 break;
                             };
                             Some(t)
-                        }
-                        LayerKind::Fill => None,
-                    };
-                    let mask = if let Some(h) = layer.mask {
-                        let Some(t) = gpu.visualizer.texture_gpu(h).cloned() else {
-                            layers_ready = false;
-                            break;
+                        } else {
+                            None
                         };
-                        Some(t)
-                    } else {
-                        None
-                    };
-                    let fill = match map {
-                        PaintMap::Albedo => layer.fill,
-                        PaintMap::Normal => layer.fill,
-                        PaintMap::Metallic | PaintMap::Roughness => {
-                            let v = luma(layer.fill);
-                            [v, v, v, 1.0]
-                        }
-                    };
-                    let mode = match layer.kind {
-                        LayerKind::Paint => 1,
-                        LayerKind::Fill => 2,
-                    };
-                    owned.push((layer.opacity, mode, fill, content, mask));
-                }
+                        let fill = match map {
+                            PaintMap::Albedo => layer.fill,
+                            PaintMap::Normal => layer.fill,
+                            PaintMap::Metallic | PaintMap::Roughness => {
+                                let v = luma(layer.fill);
+                                [v, v, v, 1.0]
+                            }
+                        };
+                        let mode = match layer.kind {
+                            LayerKind::Paint => 1,
+                            LayerKind::Fill => 2,
+                        };
+                        owned.push((layer.opacity, mode, fill, content, mask));
+                    }
 
-                let mut encoder = gpu.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor {
-                        label: Some("gpu_paint_composite_stack"),
-                    },
-                );
-                if !layers_ready {
-                    // Still wipe dst to base so the mesh isn't garbage this frame.
-                    gpu.gpu_paint.composite_stack(
-                        &gpu.device,
-                        &gpu.queue,
-                        &mut encoder,
-                        &dst,
-                        (TEX_SIZE, TEX_SIZE),
-                        self.painter.docs[map.index()].base_rgba,
-                        map.channel_mask(),
-                        &[],
-                        map == PaintMap::Normal,
+                    let mut encoder = gpu.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
+                            label: Some("gpu_paint_composite_stack"),
+                        },
                     );
-                    self.painter.docs[map.index()].mark_dirty();
-                } else {
-                    let layer_refs: Vec<CompositeLayer<'_>> = owned
-                        .iter()
-                        .map(|(opacity, mode, fill, content, mask)| CompositeLayer {
-                            opacity: *opacity,
-                            mode: *mode,
-                            fill: *fill,
-                            content: content.as_ref(),
-                            mask: mask.as_ref(),
-                        })
-                        .collect();
-                    gpu.gpu_paint.composite_stack(
-                        &gpu.device,
-                        &gpu.queue,
-                        &mut encoder,
-                        &dst,
-                        (TEX_SIZE, TEX_SIZE),
-                        self.painter.docs[map.index()].base_rgba,
-                        map.channel_mask(),
-                        &layer_refs,
-                        map == PaintMap::Normal,
-                    );
+                    if !layers_ready {
+                        gpu.gpu_paint.composite_stack(
+                            &gpu.device,
+                            &gpu.queue,
+                            &mut encoder,
+                            &dst,
+                            (TEX_SIZE, TEX_SIZE),
+                            self.painter.docs[map.index()].base_rgba,
+                            map.channel_mask(),
+                            &[],
+                            map == PaintMap::Normal,
+                        );
+                        any_missing_dst = true;
+                    } else {
+                        let layer_refs: Vec<CompositeLayer<'_>> = owned
+                            .iter()
+                            .map(|(opacity, mode, fill, content, mask)| CompositeLayer {
+                                opacity: *opacity,
+                                mode: *mode,
+                                fill: *fill,
+                                content: content.as_ref(),
+                                mask: mask.as_ref(),
+                            })
+                            .collect();
+                        gpu.gpu_paint.composite_stack(
+                            &gpu.device,
+                            &gpu.queue,
+                            &mut encoder,
+                            &dst,
+                            (TEX_SIZE, TEX_SIZE),
+                            self.painter.docs[map.index()].base_rgba,
+                            map.channel_mask(),
+                            &layer_refs,
+                            map == PaintMap::Normal,
+                        );
+                    }
+                    gpu.queue.submit(Some(encoder.finish()));
                 }
-                gpu.queue.submit(Some(encoder.finish()));
+                if any_missing_dst {
+                    self.painter.docs[map.index()].mark_dirty();
+                }
             }
 
             let aspect = vp_w as f32 / vp_h as f32;
             gpu.visualizer
                 .render_to(&self.painter.scene, aspect, &gpu.scene_target.render_view);
+
+            if self.painter.uv.needs_fit {
+                self.painter.uv.fit(&self.painter.udim_ids);
+            }
+            let uv_w = self.painter.uv.size.x.round().max(1.0) as u32;
+            let uv_h = self.painter.uv.size.y.round().max(1.0) as u32;
+            gpu.uv_target
+                .resize(&gpu.device, &mut gpu.ui_renderer, uv_w, uv_h);
+            let tiles = self.painter.material_map_tiles(self.painter.paint_map);
+            let mesh_node = self.painter.uv_mesh_node();
+            let mut uv_enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("uv_preview"),
+            });
+            gpu.uv_preview.render(
+                &gpu.device,
+                &gpu.queue,
+                &mut uv_enc,
+                &gpu.uv_target.render_view,
+                &gpu.visualizer,
+                &self.painter.scene,
+                &self.painter.uv,
+                self.painter.paint_map,
+                &tiles,
+                mesh_node,
+                &self.painter.udim_ids,
+            );
+            gpu.queue.submit(Some(uv_enc.finish()));
 
             gpu.ui_renderer
                 .sync_atlases(&gpu.device, &gpu.queue, &mut self.ui);
@@ -840,7 +1014,13 @@ impl ApplicationHandler for Host {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let ms = if self.animating || self.looking || self.panning || self.painter.painting {
+        let ms = if self.animating
+            || self.looking
+            || self.panning
+            || self.uv_panning
+            || self.painter.painting
+            || self.painter.orbit_snap_active()
+        {
             8
         } else {
             33
@@ -858,7 +1038,7 @@ impl ApplicationHandler for Host {
         event: DeviceEvent,
     ) {
         if let DeviceEvent::MouseMotion { delta } = event {
-            if self.looking || self.panning {
+            if self.looking || self.panning || self.uv_panning {
                 self.input.look_delta += Vec2::new(delta.0 as f32, delta.1 as f32);
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -912,11 +1092,19 @@ impl ApplicationHandler for Host {
                         }
                         self.input.mouse_right_down = down;
 
-                        if down && !self.want_capture_mouse && !self.looking && !self.panning {
+                        if down && !self.want_capture_mouse && !self.looking && !self.panning && !self.uv_panning {
+                            let over_uv = self
+                                .last_uv_rect
+                                .is_some_and(|r| r.contains(self.input.mouse_pos));
                             let over_vp = self
                                 .last_viewport_rect
                                 .is_some_and(|r| r.contains(self.input.mouse_pos));
-                            if over_vp {
+                            let over_gizmo = self.last_viewport_rect.is_some_and(|r| {
+                                self.painter.over_view_gizmo(self.input.mouse_pos, r)
+                            });
+                            if over_uv {
+                                // Orbit stays on the 3D view.
+                            } else if over_vp && !over_gizmo {
                                 self.set_looking(true);
                             }
                         } else if !down {
@@ -933,15 +1121,25 @@ impl ApplicationHandler for Host {
                         self.input.mouse_middle_down = down;
 
                         if down && !self.want_capture_mouse && !self.looking {
+                            let over_uv = self
+                                .last_uv_rect
+                                .is_some_and(|r| r.contains(self.input.mouse_pos));
                             let over_vp = self
                                 .last_viewport_rect
                                 .is_some_and(|r| r.contains(self.input.mouse_pos));
-                            if over_vp {
+                            let over_gizmo = self.last_viewport_rect.is_some_and(|r| {
+                                self.painter.over_view_gizmo(self.input.mouse_pos, r)
+                            });
+                            if over_uv {
+                                self.uv_panning = true;
+                                self.painter.painting = false;
+                            } else if over_vp && !over_gizmo {
                                 self.panning = true;
                                 self.painter.painting = false;
                             }
                         } else if !down {
                             self.panning = false;
+                            self.uv_panning = false;
                         }
                     }
                     _ => {}
