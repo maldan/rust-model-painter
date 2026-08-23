@@ -4,7 +4,7 @@ mod bvh;
 mod gpu_paint;
 mod paint;
 mod pick;
-mod post_ui;
+mod segment;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ use app::{Painter, SCENE_TEX};
 use brush_alpha::{ALPHA_TEX_BASE, NRM_TEX_BASE};
 use glam::Vec2;
 use gpu_paint::{cursor_to_map_px, write_paint_rgba, CompositeLayer, GpuPaint};
-use mega_render::{Visualizer, WgpuVisualizer};
+use mega_render::{Visualizer, WgpuVisualizer, WGPU_FEATURES};
 use mega_ui::wgpu::UiRenderer;
 use mega_ui::{CursorIcon, Ui, UiInput};
 use paint::{luma, LayerKind, PaintMap, PaintTool, TEX_SIZE};
@@ -267,7 +267,7 @@ impl Host {
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("model-painter"),
-            required_features: wgpu::Features::empty(),
+            required_features: adapter.features() & WGPU_FEATURES,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             required_limits: limits,
             memory_hints: wgpu::MemoryHints::Performance,
@@ -451,10 +451,10 @@ impl Host {
                 let over = rect.contains(mouse_pos);
                 if mouse_pressed && over && !out.want_capture_mouse {
                     self.painter.painting = true;
-                    self.painter.end_stroke();
-                    self.painter.paint_at(mouse_pos, rect);
+                    self.painter.begin_stroke();
+                    self.painter.viewport_interact(mouse_pos, rect);
                 } else if self.painter.painting && mouse_down && over {
-                    self.painter.paint_at(mouse_pos, rect);
+                    self.painter.viewport_interact(mouse_pos, rect);
                 }
                 if mouse_released || !mouse_down {
                     if self.painter.painting {
@@ -486,6 +486,7 @@ impl Host {
             && vp_rect.contains(mouse_pos);
         self.painter
             .update_brush_cursor(mouse_pos, vp_rect, show);
+        self.painter.sync_segment_overlay();
 
         if let Some(text) = out.clipboard {
             if let Some(cb) = self.clipboard.as_mut() {
