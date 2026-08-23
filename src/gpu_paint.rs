@@ -130,6 +130,12 @@ pub struct GpuPaint {
     stroke: Option<wgpu::Texture>,
     stroke_view: Option<wgpu::TextureView>,
     stroke_storage_view: Option<wgpu::TextureView>,
+    /// Never written after creation — copied into `stroke` to reset it. A
+    /// `queue.write_texture` reset runs on the queue timeline (before the whole
+    /// frame's command buffer), not between stamps, so multiple `stamp()` calls
+    /// in one frame (multi-UDIM, multi-stamp strokes) shared leftover coverage
+    /// from the previous call, bleeding one UDIM's brush shape into the next.
+    stroke_zero_tex: Option<wgpu::Texture>,
     stroke_zeros: Vec<u8>,
     paint_aux_size: (u32, u32),
 
@@ -431,6 +437,7 @@ impl GpuPaint {
             stroke: None,
             stroke_view: None,
             stroke_storage_view: None,
+            stroke_zero_tex: None,
             stroke_zeros: Vec::new(),
             paint_aux_size: (0, 0),
             uv_pipeline,
@@ -555,7 +562,7 @@ impl GpuPaint {
         self.depth_tex = Some(depth_tex);
     }
 
-    fn ensure_aux(&mut self, device: &wgpu::Device, w: u32, h: u32) {
+    fn ensure_aux(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32) {
         let w = w.max(1);
         let h = h.max(1);
         if self.paint_aux_size == (w, h) && self.paint_read.is_some() && self.stroke.is_some() {
@@ -604,6 +611,23 @@ impl GpuPaint {
         }));
         self.stroke = Some(stroke);
         self.stroke_zeros = vec![0u8; (w * h * 4) as usize];
+
+        let stroke_zero_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gpu_paint_stroke_zero"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        write_paint_rgba(queue, &stroke_zero_tex, &self.stroke_zeros, w, h);
+        self.stroke_zero_tex = Some(stroke_zero_tex);
     }
 
     fn sync_meshes(
@@ -850,7 +874,7 @@ impl GpuPaint {
             return;
         }
 
-        self.ensure_aux(device, tw, th);
+        self.ensure_aux(device, queue, tw, th);
         let slot = self.brush_slot;
         self.brush_slot += 1;
         self.ensure_brush_buf(device, self.brush_slot);
@@ -899,18 +923,24 @@ impl GpuPaint {
             },
         );
 
-        queue.write_texture(
+        let Some(stroke_zero_tex) = self.stroke_zero_tex.clone() else {
+            return;
+        };
+        // Encoder-recorded reset (not `queue.write_texture`, which runs on the queue
+        // timeline ahead of this frame's whole command buffer) — must land strictly
+        // between the previous stamp's composite and this stamp's splat.
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &stroke_zero_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             wgpu::TexelCopyTextureInfo {
                 texture: &stroke,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
-            },
-            &self.stroke_zeros,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * tw),
-                rows_per_image: Some(th),
             },
             wgpu::Extent3d {
                 width: tw,
@@ -1099,7 +1129,7 @@ impl GpuPaint {
         nrm_blend: bool,
     ) {
         let (tw, th) = (size.0.max(1), size.1.max(1));
-        self.ensure_aux(device, tw, th);
+        self.ensure_aux(device, queue, tw, th);
         let Some(paint_read) = self.paint_read.clone() else {
             return;
         };

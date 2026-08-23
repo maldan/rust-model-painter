@@ -92,13 +92,40 @@ fn splat(@builtin(global_invocation_id) id: vec3<u32>) {
     let facing_fade = clamp((facing - 0.15) / 0.85, 0.0, 1.0);
 
     let offset = sample_pos.xyz - center_pos.xyz;
-    let dist = length(offset);
-    // Same UDIM as cursor: allow square corners. Other UDIM (seam): strict radius
-    // so painting one island does not splash the neighbor across the cut.
     let cross_udim = abs(sample_tile.x - center_tile.x) > 0.1
         || abs(sample_tile.y - center_tile.y) > 0.1;
+    // Same tile: square corners, full 3D ball (TriPack scatters one surface's
+    // triangles across the atlas — painting all of them within the ball is correct).
     let max_dist = select(brush.world_radius * 1.5, brush.world_radius, cross_udim);
-    if (dist > max_dist) { return; }
+    if (length(offset) > max_dist) { return; }
+
+    if (cross_udim) {
+        // Curvature (e.g. a sphere) keeps far geometry coplanar and similarly
+        // oriented to the brush, so those tests alone can't tell "real seam" from
+        // "just another spot on the same curved surface". A real seam is a visible
+        // screen-space boundary: this UDIM's pixels sit right next to the cursor's
+        // UDIM in the rendered image. Scan a small ring for that neighbor.
+        var near_seam = false;
+        let radii = array<i32, 2>(3, 7);
+        for (var ri = 0; ri < 2 && !near_seam; ri = ri + 1) {
+            let r = radii[ri];
+            for (var k = 0; k < 8 && !near_seam; k = k + 1) {
+                let ang = f32(k) * 0.7853981634;
+                let nx = i32(id.x) + i32(round(f32(r) * cos(ang)));
+                let ny = i32(id.y) + i32(round(f32(r) * sin(ang)));
+                if (nx < 0 || ny < 0 || nx >= i32(brush.map_w) || ny >= i32(brush.map_h)) {
+                    continue;
+                }
+                let nb = textureLoad(uv_map, vec2<i32>(nx, ny), 0);
+                if (nb.a < 0.5) { continue; }
+                let nb_tile = floor(nb.xy);
+                if (abs(nb_tile.x - center_tile.x) < 0.1 && abs(nb_tile.y - center_tile.y) < 0.1) {
+                    near_seam = true;
+                }
+            }
+        }
+        if (!near_seam) { return; }
+    }
 
     var n = brush.normal;
     if (dot(n, n) < 1e-8) {

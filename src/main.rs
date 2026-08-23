@@ -729,11 +729,9 @@ impl Host {
                         };
                         let tile = crate::uv::udim_origin(udim);
                         for stamp in &stamps {
-                            // Every UDIM tile: shader keeps only samples with floor(uv)==tile.
-                            // Cursor-tile filtering broke seams; neighbor-reach caused splash.
+                            // All tiles: same-UDIM is free; cross-UDIM needs coplanar seam
+                            // (see splat.wgsl) so a circle on the cut hits both without splash.
                             let center = cursor_to_map_px(stamp.screen, stamp.viewport, vp_w, vp_h);
-                            // Keep screen search close to the real brush — *2 pulled in
-                            // other UDIM islands and looked like random leak.
                             let screen_r = stamp.screen_radius_px.max(4.0);
                             gpu.gpu_paint.stamp(
                                 &gpu.device,
@@ -753,8 +751,8 @@ impl Host {
                                 nrm_stamp,
                                 tile,
                             );
+                            did_stamp = true;
                         }
-                        did_stamp = true;
                     }
                 }
                 gpu.queue.submit(Some(encoder.finish()));
