@@ -80,13 +80,25 @@ fn splat(@builtin(global_invocation_id) id: vec3<u32>) {
     let sample_pos = textureLoad(pos_map, vec2<i32>(i32(id.x), i32(id.y)), 0);
     if (sample_uv.a < 0.5 || abs(sample_pos.a) < 0.5) { return; }
 
+    // Only this tile's UVs — other tiles get their own stamp pass.
+    let center_tile = floor(center_uv.xy);
+    let sample_tile = floor(sample_uv.xy);
+    if (abs(sample_tile.x - brush.tile.x) > 0.1 || abs(sample_tile.y - brush.tile.y) > 0.1) {
+        return;
+    }
+
     let facing = sample_uv.b;
     if (facing < 0.15) { return; }
     let facing_fade = clamp((facing - 0.15) / 0.85, 0.0, 1.0);
 
     let offset = sample_pos.xyz - center_pos.xyz;
-    // Allow square / diamond corners (radius * sqrt(2)).
-    if (length(offset) > brush.world_radius * 1.5) { return; }
+    let dist = length(offset);
+    // Same UDIM as cursor: allow square corners. Other UDIM (seam): strict radius
+    // so painting one island does not splash the neighbor across the cut.
+    let cross_udim = abs(sample_tile.x - center_tile.x) > 0.1
+        || abs(sample_tile.y - center_tile.y) > 0.1;
+    let max_dist = select(brush.world_radius * 1.5, brush.world_radius, cross_udim);
+    if (dist > max_dist) { return; }
 
     var n = brush.normal;
     if (dot(n, n) < 1e-8) {
@@ -127,10 +139,6 @@ fn splat(@builtin(global_invocation_id) id: vec3<u32>) {
     cover *= facing_fade;
     if (cover < 0.001) { return; }
 
-    let tile = floor(sample_uv.xy);
-    if (abs(tile.x - brush.tile.x) > 0.1 || abs(tile.y - brush.tile.y) > 0.1) {
-        return;
-    }
     let uv = min(fract(sample_uv.xy), vec2<f32>(0.99999));
     let tc = vec2<i32>(
         i32(floor(uv.x * f32(brush.tex_w))),

@@ -41,6 +41,8 @@ pub struct PendingStamp {
     /// Screen-space search radius at stamp depth (viewport pixels).
     pub screen_radius_px: f32,
     pub plane_normal: Vec3,
+    /// Surface UV under the cursor (`None` if the pick missed).
+    pub uv: Option<Vec2>,
 }
 
 pub struct Painter {
@@ -122,10 +124,12 @@ impl Painter {
 
         // Material composite targets (filled by GPU layer composite).
         let mut albedo = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, true);
+        albedo.ensure_rgba();
         fill_rgba(&mut albedo.rgba, 220, 220, 225, 255);
         let albedo_tex = scene.textures.insert(albedo);
 
         let mut mr = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false);
+        mr.ensure_rgba();
         let rough_u8 = (rough * 255.0) as u8;
         for px in mr.rgba.chunks_exact_mut(4) {
             px[0] = 255;
@@ -136,6 +140,7 @@ impl Painter {
         let mr_tex = scene.textures.insert(mr);
 
         let mut nrm = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false);
+        nrm.ensure_rgba();
         fill_rgba(&mut nrm.rgba, 128, 128, 255, 255);
         let nrm_tex = scene.textures.insert(nrm);
 
@@ -684,11 +689,13 @@ impl Painter {
         let rough_u8 = (rough * 255.0) as u8;
         for &id in self.udim_ids.iter().skip(1) {
             let mut albedo = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, true);
+            albedo.ensure_rgba();
             fill_rgba(&mut albedo.rgba, 220, 220, 225, 255);
             self.extra_albedo
                 .push((id, self.scene.textures.insert(albedo)));
 
             let mut mr = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false);
+            mr.ensure_rgba();
             for px in mr.rgba.chunks_exact_mut(4) {
                 px[0] = 255;
                 px[1] = rough_u8;
@@ -698,6 +705,7 @@ impl Painter {
             self.extra_mr.push((id, self.scene.textures.insert(mr)));
 
             let mut nrm = Texture::gpu_resident(TEX_SIZE, TEX_SIZE, false);
+            nrm.ensure_rgba();
             fill_rgba(&mut nrm.rgba, 128, 128, 255, 255);
             self.extra_nrm.push((id, self.scene.textures.insert(nrm)));
         }
@@ -773,6 +781,7 @@ impl Painter {
 
     fn rebuild_bvhs(&mut self) {
         let t0 = Instant::now();
+        self.bvh_cache.clear();
         pick::ensure_bvhs(&self.scene, &self.paintable, &mut self.bvh_cache);
         let ms = t0.elapsed().as_secs_f32() * 1000.0;
         let tris: usize = self
@@ -892,9 +901,11 @@ impl Painter {
 
         // Reset CPU mirrors (gpu_resident won't re-upload on version bump alone).
         if let Some(tex) = self.scene.textures.get_mut(self.albedo_tex) {
+            tex.ensure_rgba();
             fill_rgba(&mut tex.rgba, 220, 220, 225, 255);
         }
         if let Some(tex) = self.scene.textures.get_mut(self.mr_tex) {
+            tex.ensure_rgba();
             for px in tex.rgba.chunks_exact_mut(4) {
                 px[0] = 255;
                 px[1] = rough_u8;
@@ -903,15 +914,18 @@ impl Painter {
             }
         }
         if let Some(tex) = self.scene.textures.get_mut(self.nrm_tex) {
+            tex.ensure_rgba();
             fill_rgba(&mut tex.rgba, 128, 128, 255, 255);
         }
         for (_, h) in &self.extra_albedo {
             if let Some(tex) = self.scene.textures.get_mut(*h) {
+                tex.ensure_rgba();
                 fill_rgba(&mut tex.rgba, 220, 220, 225, 255);
             }
         }
         for (_, h) in &self.extra_mr {
             if let Some(tex) = self.scene.textures.get_mut(*h) {
+                tex.ensure_rgba();
                 for px in tex.rgba.chunks_exact_mut(4) {
                     px[0] = 255;
                     px[1] = rough_u8;
@@ -922,6 +936,7 @@ impl Painter {
         }
         for (_, h) in &self.extra_nrm {
             if let Some(tex) = self.scene.textures.get_mut(*h) {
+                tex.ensure_rgba();
                 fill_rgba(&mut tex.rgba, 128, 128, 255, 255);
             }
         }
@@ -1019,15 +1034,15 @@ impl Painter {
             }
         }
         self.last_stamp_px = Some(local);
-        let plane_normal = self
-            .pick_hit(screen, viewport)
-            .map(|h| h.normal)
-            .unwrap_or(Vec3::Y);
+        let hit = self.pick_hit(screen, viewport);
+        let plane_normal = hit.map(|h| h.normal).unwrap_or(Vec3::Y);
+        let uv = hit.map(|h| h.uv);
         self.pending_stamps.push(PendingStamp {
             screen,
             viewport,
             screen_radius_px: radius_px,
             plane_normal,
+            uv,
         });
         self.doc_mut().mark_dirty();
     }

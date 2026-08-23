@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
 use mega_render::{Handle, Mesh, Node, Scene, Texture, WgpuVisualizer};
-use wgpu::util::DeviceExt;
 
 use crate::paint::PaintMap;
 use crate::uv::udim_origin;
@@ -128,6 +127,9 @@ pub struct UvPreview {
     white_view: wgpu::TextureView,
     _white_tex: wgpu::Texture,
     wires: HashMap<(u32, u32), WireCache>,
+    /// Reused — never dropped while the previous frame's encoder is still on the GPU.
+    tile_vbs: Vec<GrowVb>,
+    border_vb: GrowVb,
 }
 
 impl UvPreview {
@@ -280,6 +282,8 @@ impl UvPreview {
             white_view,
             _white_tex: white_tex,
             wires: HashMap::new(),
+            tile_vbs: Vec::new(),
+            border_vb: GrowVb::default(),
         }
     }
 
@@ -336,37 +340,35 @@ impl UvPreview {
             }),
         );
 
-        let mut tile_bufs: Vec<wgpu::Buffer> = Vec::new();
         let mut tile_views: Vec<wgpu::TextureView> = Vec::new();
         let ids: Vec<u32> = if udim_ids.is_empty() {
             vec![1001]
         } else {
             udim_ids.to_vec()
         };
-        for &id in &ids {
+        while self.tile_vbs.len() < ids.len() {
+            self.tile_vbs.push(GrowVb::default());
+        }
+        for (i, &id) in ids.iter().enumerate() {
             let origin = udim_origin(id);
             let o = Vec2::new(origin[0], origin[1]);
             let verts = tile_quad(o);
-            let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("uv_tile_vb"),
-                contents: bytemuck::cast_slice(&verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+            self.tile_vbs[i].write(device, queue, "uv_tile_vb", bytemuck::cast_slice(&verts));
             let tex_view = tiles
                 .iter()
                 .find(|(tid, _)| *tid == id)
                 .and_then(|(_, h)| visualizer.texture_view(*h).cloned())
                 .unwrap_or_else(|| self.white_view.clone());
             tile_views.push(tex_view);
-            tile_bufs.push(buf);
         }
 
         let border_verts = tile_borders(&ids);
-        let border_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("uv_border_vb"),
-            contents: bytemuck::cast_slice(&border_verts),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        self.border_vb.write(
+            device,
+            queue,
+            "uv_border_vb",
+            bytemuck::cast_slice(&border_verts),
+        );
         let border_count = border_verts.len() as u32;
 
         let mesh = mesh_node.and_then(|nh| {
@@ -375,7 +377,7 @@ impl UvPreview {
             scene.meshes.get(mh).map(|m| (mh, m))
         });
         if let Some((mh, m)) = mesh {
-            self.sync_wires(device, mh, m);
+            self.sync_wires(device, queue, mh, m);
         }
         let wire = mesh.and_then(|(mh, _)| self.wires.get(&mh.key()));
 
@@ -421,15 +423,22 @@ impl UvPreview {
             });
             pass.set_pipeline(&self.tile_pipeline);
             pass.set_bind_group(0, &self.view_bg, &[]);
-            for (buf, bg) in tile_bufs.iter().zip(tile_bgs.iter()) {
+            for (i, bg) in tile_bgs.iter().enumerate() {
+                let Some(buf) = self.tile_vbs.get(i).and_then(|g| g.buf.as_ref()) else {
+                    continue;
+                };
                 pass.set_bind_group(1, bg, &[]);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..6, 0..1);
             }
             pass.set_pipeline(&self.line_pipeline);
             pass.set_bind_group(0, &self.view_bg, &[]);
-            pass.set_vertex_buffer(0, border_buf.slice(..));
-            pass.draw(0..border_count, 0..1);
+            if border_count > 0 {
+                if let Some(ref border_buf) = self.border_vb.buf {
+                    pass.set_vertex_buffer(0, border_buf.slice(..));
+                    pass.draw(0..border_count, 0..1);
+                }
+            }
             if view.show_uv {
                 if let Some(w) = wire {
                     if w.count > 0 {
@@ -441,7 +450,13 @@ impl UvPreview {
         }
     }
 
-    fn sync_wires(&mut self, device: &wgpu::Device, mh: Handle<Mesh>, mesh: &Mesh) {
+    fn sync_wires(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mh: Handle<Mesh>,
+        mesh: &Mesh,
+    ) {
         let key = mh.key();
         if self
             .wires
@@ -461,11 +476,7 @@ impl UvPreview {
         } else {
             bytemuck::cast_slice(&verts)
         };
-        let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("uv_wire_vb"),
-            contents: bytes,
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let buf = write_vb(device, queue, "uv_wire_vb", bytes);
         self.wires.insert(
             key,
             WireCache {
@@ -475,6 +486,48 @@ impl UvPreview {
             },
         );
     }
+}
+
+#[derive(Default)]
+struct GrowVb {
+    buf: Option<wgpu::Buffer>,
+    cap: u64,
+}
+
+impl GrowVb {
+    fn write(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, label: &str, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let size = (bytes.len() as u64).max(wgpu::COPY_BUFFER_ALIGNMENT);
+        if self.cap < size {
+            let cap = size.next_power_of_two().max(256);
+            self.buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: cap,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.cap = cap;
+        }
+        if let Some(buf) = self.buf.as_ref() {
+            queue.write_buffer(buf, 0, bytes);
+        }
+    }
+}
+
+fn write_vb(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, bytes: &[u8]) -> wgpu::Buffer {
+    let size = (bytes.len() as u64).max(wgpu::COPY_BUFFER_ALIGNMENT);
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    if !bytes.is_empty() {
+        queue.write_buffer(&buf, 0, bytes);
+    }
+    buf
 }
 
 fn tile_quad(origin: Vec2) -> [TileVert; 6] {

@@ -10,13 +10,12 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3};
 use mega_render::{Handle, Mesh, Node, Scene};
 use mega_ui::Rect;
-use wgpu::util::DeviceExt;
 
 use crate::brush_alpha::{BrushAlpha, NormalStamp};
 use crate::paint::Brush;
 
-/// Uniform slot stride for dynamic-offset stack passes (WebGPU min alignment).
-const STACK_UBO_STRIDE: u64 = 256;
+/// Uniform slot stride for dynamic-offset passes (WebGPU min alignment).
+const UBO_STRIDE: u64 = 256;
 
 const UV_CLEAR: wgpu::Color = wgpu::Color {
     r: 0.0,
@@ -144,6 +143,9 @@ pub struct GpuPaint {
     comp_pipeline: wgpu::ComputePipeline,
     comp_bind_layout: wgpu::BindGroupLayout,
     brush_buf: wgpu::Buffer,
+    brush_buf_slots: u32,
+    /// Next free brush UBO slot within the current encoder batch.
+    brush_slot: u32,
 
     alpha_texs: Vec<wgpu::Texture>,
     alpha_views: Vec<wgpu::TextureView>,
@@ -164,6 +166,11 @@ pub struct GpuPaint {
     fill_bytes: Vec<u8>,
 
     meshes: HashMap<(u32, u32), PaintMesh>,
+    /// Held until later frames so the paint encoder can submit them.
+    models_buf: Option<wgpu::Buffer>,
+    models_slots: u64,
+    keep_bgs: [Vec<wgpu::BindGroup>; 2],
+    keep_i: usize,
 }
 
 impl GpuPaint {
@@ -281,7 +288,7 @@ impl GpuPaint {
         let splat_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("gpu_paint_splat_layout"),
             entries: &[
-                ubo_entry(0),
+                brush_ubo_entry(0),
                 tex_entry(1),
                 tex_entry(2),
                 storage_entry(3),
@@ -309,7 +316,7 @@ impl GpuPaint {
         let comp_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("gpu_paint_comp_layout"),
             entries: &[
-                ubo_entry(0),
+                brush_ubo_entry(0),
                 tex_entry(1),
                 tex_entry(2),
                 storage_entry(3),
@@ -333,7 +340,7 @@ impl GpuPaint {
 
         let brush_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpu_paint_brush_ubo"),
-            size: std::mem::size_of::<BrushUniforms>() as u64,
+            size: UBO_STRIDE * 8,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -376,7 +383,7 @@ impl GpuPaint {
         });
         let stack_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpu_paint_stack_ubo"),
-            size: STACK_UBO_STRIDE * 8,
+            size: UBO_STRIDE * 8,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -435,6 +442,8 @@ impl GpuPaint {
             comp_pipeline,
             comp_bind_layout,
             brush_buf,
+            brush_buf_slots: 8,
+            brush_slot: 0,
             stack_pipeline,
             stack_bind_layout,
             stack_buf,
@@ -444,6 +453,10 @@ impl GpuPaint {
             fill_px: [0, 0, 0, 0],
             fill_bytes: Vec::new(),
             meshes: HashMap::new(),
+            models_buf: None,
+            models_slots: 0,
+            keep_bgs: [Vec::new(), Vec::new()],
+            keep_i: 0,
             alpha_texs: Vec::new(),
             alpha_views: Vec::new(),
             nrm_texs: Vec::new(),
@@ -593,7 +606,13 @@ impl GpuPaint {
         self.stroke_zeros = vec![0u8; (w * h * 4) as usize];
     }
 
-    fn sync_meshes(&mut self, device: &wgpu::Device, scene: &Scene, paintable: &[Handle<Node>]) {
+    fn sync_meshes(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+        paintable: &[Handle<Node>],
+    ) {
         let mut live = HashMap::new();
         for &node_h in paintable {
             let Some(node) = scene.nodes.get(node_h) else {
@@ -613,7 +632,7 @@ impl GpuPaint {
             if self.meshes.get(&key).map(|m| m.synced) == Some(mesh.version) {
                 continue;
             }
-            self.meshes.insert(key, upload_paint_mesh(device, mesh));
+            self.meshes.insert(key, upload_paint_mesh(device, queue, mesh));
         }
         self.meshes.retain(|k, _| live.contains_key(k));
     }
@@ -627,7 +646,12 @@ impl GpuPaint {
         paintable: &[Handle<Node>],
         aspect: f32,
     ) {
-        self.sync_meshes(device, scene, paintable);
+        self.keep_i ^= 1;
+        self.keep_bgs[self.keep_i].clear();
+        self.brush_slot = 0;
+        // Reserve up front — recreating brush_buf mid-batch would drop earlier slot writes.
+        self.ensure_brush_buf(device, 64);
+        self.sync_meshes(device, queue, scene, paintable);
 
         let Some(uv_view) = self.uv_view.clone() else {
             return;
@@ -733,15 +757,21 @@ impl GpuPaint {
 
         const ALIGN: u64 = 256;
         let stride = ALIGN;
-        let models_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gpu_paint_models"),
-            size: stride * draws.len() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let slots = (draws.len() as u64).max(1);
+        if self.models_slots < slots {
+            let cap = slots.next_power_of_two().max(8);
+            self.models_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpu_paint_models"),
+                size: stride * cap,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.models_slots = cap;
+        }
+        let models_buf = self.models_buf.as_ref().expect("models_buf");
         for (i, d) in draws.iter().enumerate() {
             queue.write_buffer(
-                &models_buf,
+                models_buf,
                 i as u64 * stride,
                 bytemuck::bytes_of(&ObjectUniforms {
                     model: d.model.to_cols_array_2d(),
@@ -757,7 +787,7 @@ impl GpuPaint {
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &models_buf,
+                        buffer: models_buf,
                         offset: i as u64 * stride,
                         size: std::num::NonZeroU64::new(
                             std::mem::size_of::<ObjectUniforms>() as u64,
@@ -792,6 +822,7 @@ impl GpuPaint {
                 pass.draw_indexed(0..d.mesh.index_count, 0, 0..1);
             }
         }
+        self.keep_bgs[self.keep_i].append(&mut object_bgs);
     }
 
     pub fn stamp(
@@ -820,6 +851,9 @@ impl GpuPaint {
         }
 
         self.ensure_aux(device, tw, th);
+        let slot = self.brush_slot;
+        self.brush_slot += 1;
+        self.ensure_brush_buf(device, self.brush_slot);
         let Some(uv_view) = self.uv_view.clone() else {
             return;
         };
@@ -904,7 +938,17 @@ impl GpuPaint {
             normal: plane_normal.normalize_or_zero().to_array(),
             normal_mode: if normal_mode { 1.0 } else { 0.0 },
         };
-        queue.write_buffer(&self.brush_buf, 0, bytemuck::bytes_of(&uniforms));
+        queue.write_buffer(
+            &self.brush_buf,
+            slot as u64 * UBO_STRIDE,
+            bytemuck::bytes_of(&uniforms),
+        );
+        let brush_off = slot * UBO_STRIDE as u32;
+        let brush_binding = wgpu::BufferBinding {
+            buffer: &self.brush_buf,
+            offset: 0,
+            size: std::num::NonZeroU64::new(std::mem::size_of::<BrushUniforms>() as u64),
+        };
 
         let views = if normal_mode {
             &self.nrm_views
@@ -922,7 +966,7 @@ impl GpuPaint {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.brush_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(brush_binding.clone()),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -956,7 +1000,7 @@ impl GpuPaint {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.splat_pipeline);
-            pass.set_bind_group(0, &splat_bg, &[]);
+            pass.set_bind_group(0, &splat_bg, &[brush_off]);
             pass.dispatch_workgroups(mw.div_ceil(8), mh.div_ceil(8), 1);
         }
 
@@ -971,7 +1015,7 @@ impl GpuPaint {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.brush_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(brush_binding),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -993,9 +1037,11 @@ impl GpuPaint {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.comp_pipeline);
-            pass.set_bind_group(0, &comp_bg, &[]);
+            pass.set_bind_group(0, &comp_bg, &[brush_off]);
             pass.dispatch_workgroups(tw.div_ceil(8), th.div_ceil(8), 1);
         }
+        self.keep_bgs[self.keep_i].push(splat_bg);
+        self.keep_bgs[self.keep_i].push(comp_bg);
     }
 
     /// Clear a gpu-resident paint texture to transparent black.
@@ -1065,9 +1111,9 @@ impl GpuPaint {
         self.ensure_stack_buf(device, slots);
 
         // Pack all pass uniforms up-front (256-byte stride).
-        let mut blob = vec![0u8; (STACK_UBO_STRIDE as usize) * slots as usize];
+        let mut blob = vec![0u8; (UBO_STRIDE as usize) * slots as usize];
         let write_slot = |blob: &mut [u8], slot: u32, u: StackUniforms| {
-            let off = (slot as usize) * STACK_UBO_STRIDE as usize;
+            let off = (slot as usize) * UBO_STRIDE as usize;
             blob[off..off + std::mem::size_of::<StackUniforms>()]
                 .copy_from_slice(bytemuck::bytes_of(&u));
         };
@@ -1178,7 +1224,7 @@ impl GpuPaint {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &bg, &[slot * STACK_UBO_STRIDE as u32]);
+                pass.set_bind_group(0, &bg, &[slot * UBO_STRIDE as u32]);
                 pass.dispatch_workgroups(tw.div_ceil(8), th.div_ceil(8), 1);
             }
         };
@@ -1202,10 +1248,39 @@ impl GpuPaint {
         self.stack_buf_slots = slots.next_power_of_two().max(8);
         self.stack_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpu_paint_stack_ubo"),
-            size: STACK_UBO_STRIDE * self.stack_buf_slots as u64,
+            size: UBO_STRIDE * self.stack_buf_slots as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+    }
+
+    fn ensure_brush_buf(&mut self, device: &wgpu::Device, slots: u32) {
+        let slots = slots.max(1);
+        if slots <= self.brush_buf_slots {
+            return;
+        }
+        self.brush_buf_slots = slots.next_power_of_two().max(8);
+        self.brush_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_paint_brush_ubo"),
+            size: UBO_STRIDE * self.brush_buf_slots as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+}
+
+fn brush_ubo_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: true,
+            min_binding_size: std::num::NonZeroU64::new(
+                std::mem::size_of::<BrushUniforms>() as u64,
+            ),
+        },
+        count: None,
     }
 }
 
@@ -1313,7 +1388,27 @@ fn upload_stamp_rgba(
     (tex, view)
 }
 
-fn upload_paint_mesh(device: &wgpu::Device, mesh: &Mesh) -> PaintMesh {
+fn upload_gpu_buf(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    bytes: &[u8],
+    usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
+    let size = (bytes.len() as u64).max(wgpu::COPY_BUFFER_ALIGNMENT);
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: usage | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    if !bytes.is_empty() {
+        queue.write_buffer(&buf, 0, bytes);
+    }
+    buf
+}
+
+fn upload_paint_mesh(device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh) -> PaintMesh {
     let verts: Vec<UvVertex> = mesh
         .positions
         .iter()
@@ -1334,16 +1429,20 @@ fn upload_paint_mesh(device: &wgpu::Device, mesh: &Mesh) -> PaintMesh {
         })
         .collect();
     PaintMesh {
-        vertex_buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("gpu_paint_mesh_vb"),
-            contents: bytemuck::cast_slice(&verts),
-            usage: wgpu::BufferUsages::VERTEX,
-        }),
-        index_buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("gpu_paint_mesh_ib"),
-            contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        }),
+        vertex_buf: upload_gpu_buf(
+            device,
+            queue,
+            "gpu_paint_mesh_vb",
+            bytemuck::cast_slice(&verts),
+            wgpu::BufferUsages::VERTEX,
+        ),
+        index_buf: upload_gpu_buf(
+            device,
+            queue,
+            "gpu_paint_mesh_ib",
+            bytemuck::cast_slice(&mesh.indices),
+            wgpu::BufferUsages::INDEX,
+        ),
         index_count: mesh.indices.len() as u32,
         synced: mesh.version,
     }

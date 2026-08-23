@@ -20,6 +20,13 @@ pub fn udim_origin(udim: u32) -> [f32; 2] {
     [(n % 10) as f32, (n / 10) as f32]
 }
 
+/// Inverse of [`udim_origin`]: `floor(uv)` → Mari id.
+pub fn udim_from_uv(uv: Vec2) -> u32 {
+    let u = uv.x.floor().clamp(0.0, 9.0) as u32;
+    let v = uv.y.floor().clamp(0.0, 9.0) as u32;
+    1001 + u + v * 10
+}
+
 /// Local UVs in `[0,1]` for the given triangle indices, same order as `tris`.
 pub trait UnwrapAlgo {
     fn name(&self) -> &'static str;
@@ -185,6 +192,13 @@ mod tests {
             vec![[0.0, 0.0]; 4],
             vec![0, 1, 2, 1, 3, 2],
         )
+    }
+
+    #[test]
+    fn mari_id_from_uv() {
+        assert_eq!(udim_from_uv(Vec2::new(0.2, 0.3)), 1001);
+        assert_eq!(udim_from_uv(Vec2::new(1.2, 0.3)), 1002);
+        assert_eq!(udim_from_uv(Vec2::new(0.2, 1.1)), 1011);
     }
 
     #[test]
