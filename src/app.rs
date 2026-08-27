@@ -172,6 +172,7 @@ impl Painter {
         let mesh_ground = scene.meshes.insert(plane(8.0, 8.0));
 
         let root = scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: "root".into(),
             parent: None,
             local: Transform::default(),
@@ -182,6 +183,7 @@ impl Painter {
         });
 
         scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: "ground".into(),
             parent: Some(root),
             local: Transform::default(),
@@ -192,6 +194,7 @@ impl Painter {
         });
 
         let sphere_node = scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: "paint_sphere".into(),
             parent: Some(root),
             local: Transform::from_translation(Vec3::new(0.0, 0.7, 0.0)),
@@ -202,6 +205,7 @@ impl Painter {
         });
 
         let cube_node = scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: "paint_cube".into(),
             parent: Some(root),
             local: Transform::from_translation(Vec3::new(0.0, 0.55, 0.0)),

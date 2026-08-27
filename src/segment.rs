@@ -296,6 +296,7 @@ mod tests {
         let mut scene = Scene::new();
         let mh = scene.meshes.insert(tri_mesh());
         let node = scene.nodes.insert(mega_render::Node {
+            id: Node::new_id(),
             name: "n".into(),
             parent: None,
             local: mega_render::Transform::default(),
