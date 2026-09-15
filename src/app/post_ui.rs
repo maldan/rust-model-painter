@@ -15,8 +15,8 @@ pub fn post_effects_panel(ui: &mut Ui, post: &mut PostProcessSettings, scene: &m
         );
         ui.separator();
 
-        ui.collapsing_header("Env Map", |ui| {
-            if ui.checkbox("Enabled", &mut post.env.enabled).changed() {
+        ui.collapsing_header("env_map", "Env Map", |ui| {
+            if ui.checkbox("env_enabled", "Enabled", &mut post.env.enabled).changed() {
                 keep = true;
             }
             ui.label("Equirect reflections + skybox");
@@ -38,8 +38,8 @@ pub fn post_effects_panel(ui: &mut Ui, post: &mut PostProcessSettings, scene: &m
             });
         });
 
-        ui.collapsing_header("AO", |ui| {
-            if ui.checkbox("Enabled", &mut post.ao.enabled).changed() {
+        ui.collapsing_header("ao", "AO", |ui| {
+            if ui.checkbox("ao_enabled", "Enabled", &mut post.ao.enabled).changed() {
                 keep = true;
             }
             ui.add_enabled(post.ao.enabled, |ui| {
@@ -108,9 +108,9 @@ pub fn post_effects_panel(ui: &mut Ui, post: &mut PostProcessSettings, scene: &m
             });
         });
 
-        ui.collapsing_header("Contact Shadows", |ui| {
+        ui.collapsing_header("contact_shadows", "Contact Shadows", |ui| {
             if ui
-                .checkbox("Enabled", &mut post.contact_shadow.enabled)
+                .checkbox("cs_enabled", "Enabled", &mut post.contact_shadow.enabled)
                 .changed()
             {
                 keep = true;
@@ -161,8 +161,8 @@ pub fn post_effects_panel(ui: &mut Ui, post: &mut PostProcessSettings, scene: &m
             });
         });
 
-        ui.collapsing_header("SSGI", |ui| {
-            if ui.checkbox("Enabled", &mut post.ssgi.enabled).changed() {
+        ui.collapsing_header("ssgi", "SSGI", |ui| {
+            if ui.checkbox("ssgi_enabled", "Enabled", &mut post.ssgi.enabled).changed() {
                 keep = true;
             }
             ui.add_enabled(post.ssgi.enabled, |ui| {
@@ -225,7 +225,7 @@ pub fn post_effects_panel(ui: &mut Ui, post: &mut PostProcessSettings, scene: &m
                 {
                     keep = true;
                 }
-                if ui.checkbox("Temporal", &mut post.ssgi.temporal).changed() {
+                if ui.checkbox("ssgi_temporal", "Temporal", &mut post.ssgi.temporal).changed() {
                     keep = true;
                 }
                 ui.add_enabled(post.ssgi.temporal, |ui| {
@@ -240,8 +240,8 @@ pub fn post_effects_panel(ui: &mut Ui, post: &mut PostProcessSettings, scene: &m
             });
         });
 
-        ui.collapsing_header("SSR", |ui| {
-            if ui.checkbox("Enabled", &mut post.ssr.enabled).changed() {
+        ui.collapsing_header("ssr", "SSR", |ui| {
+            if ui.checkbox("ssr_enabled", "Enabled", &mut post.ssr.enabled).changed() {
                 keep = true;
             }
             ui.add_enabled(post.ssr.enabled, |ui| {
@@ -279,14 +279,14 @@ pub fn post_effects_panel(ui: &mut Ui, post: &mut PostProcessSettings, scene: &m
                 {
                     keep = true;
                 }
-                if ui.checkbox("Temporal", &mut post.ssr.temporal).changed() {
+                if ui.checkbox("ssr_temporal", "Temporal", &mut post.ssr.temporal).changed() {
                     keep = true;
                 }
             });
         });
 
-        ui.collapsing_header("Bloom", |ui| {
-            if ui.checkbox("Enabled", &mut post.bloom.enabled).changed() {
+        ui.collapsing_header("bloom", "Bloom", |ui| {
+            if ui.checkbox("bloom_enabled", "Enabled", &mut post.bloom.enabled).changed() {
                 keep = true;
             }
             ui.add_enabled(post.bloom.enabled, |ui| {
@@ -307,13 +307,13 @@ pub fn post_effects_panel(ui: &mut Ui, post: &mut PostProcessSettings, scene: &m
             });
         });
 
-        ui.collapsing_header("DOF", |ui| {
-            if ui.checkbox("Enabled", &mut post.dof.enabled).changed() {
+        ui.collapsing_header("dof", "DOF", |ui| {
+            if ui.checkbox("dof_enabled", "Enabled", &mut post.dof.enabled).changed() {
                 keep = true;
             }
             ui.add_enabled(post.dof.enabled, |ui| {
                 if ui
-                    .checkbox("Auto focus", &mut post.dof.auto_focus)
+                    .checkbox("dof_auto_focus", "Auto focus", &mut post.dof.auto_focus)
                     .changed()
                 {
                     keep = true;
@@ -361,23 +361,23 @@ pub fn post_effects_panel(ui: &mut Ui, post: &mut PostProcessSettings, scene: &m
                     keep = true;
                 }
                 if ui
-                    .checkbox("Half-res gather", &mut post.dof.half_res)
+                    .checkbox("dof_half_res", "Half-res gather", &mut post.dof.half_res)
                     .changed()
                 {
                     keep = true;
                 }
-                if ui.checkbox("Temporal", &mut post.dof.temporal).changed() {
+                if ui.checkbox("dof_temporal", "Temporal", &mut post.dof.temporal).changed() {
                     keep = true;
                 }
             });
         });
 
-        ui.collapsing_header("Tonemap", |ui| {
-            if ui.checkbox("Enabled", &mut post.tonemap.enabled).changed() {
+        ui.collapsing_header("tonemap", "Tonemap", |ui| {
+            if ui.checkbox("tm_enabled", "Enabled", &mut post.tonemap.enabled).changed() {
                 keep = true;
             }
             ui.add_enabled(post.tonemap.enabled, |ui| {
-                if ui.checkbox("ACES", &mut post.tonemap.aces).changed() {
+                if ui.checkbox("tm_aces", "ACES", &mut post.tonemap.aces).changed() {
                     keep = true;
                 }
                 ui.label("Exposure");
@@ -390,8 +390,8 @@ pub fn post_effects_panel(ui: &mut Ui, post: &mut PostProcessSettings, scene: &m
             });
         });
 
-        ui.collapsing_header("Color Grade", |ui| {
-            if ui.checkbox("Enabled", &mut post.color_grade.enabled).changed() {
+        ui.collapsing_header("color_grade", "Color Grade", |ui| {
+            if ui.checkbox("cg_enabled", "Enabled", &mut post.color_grade.enabled).changed() {
                 keep = true;
             }
             ui.add_enabled(post.color_grade.enabled, |ui| {
@@ -419,8 +419,8 @@ pub fn post_effects_panel(ui: &mut Ui, post: &mut PostProcessSettings, scene: &m
             });
         });
 
-        ui.collapsing_header("Vignette", |ui| {
-            if ui.checkbox("Enabled", &mut post.vignette.enabled).changed() {
+        ui.collapsing_header("vignette", "Vignette", |ui| {
+            if ui.checkbox("vig_enabled", "Enabled", &mut post.vignette.enabled).changed() {
                 keep = true;
             }
             ui.add_enabled(post.vignette.enabled, |ui| {
@@ -441,8 +441,8 @@ pub fn post_effects_panel(ui: &mut Ui, post: &mut PostProcessSettings, scene: &m
             });
         });
 
-        ui.collapsing_header("Film Grain", |ui| {
-            if ui.checkbox("Enabled", &mut post.grain.enabled).changed() {
+        ui.collapsing_header("film_grain", "Film Grain", |ui| {
+            if ui.checkbox("grain_enabled", "Enabled", &mut post.grain.enabled).changed() {
                 keep = true;
             }
             ui.add_enabled(post.grain.enabled, |ui| {
@@ -456,14 +456,14 @@ pub fn post_effects_panel(ui: &mut Ui, post: &mut PostProcessSettings, scene: &m
             });
         });
 
-        ui.collapsing_header("FXAA", |ui| {
-            if ui.checkbox("Enabled", &mut post.fxaa.enabled).changed() {
+        ui.collapsing_header("fxaa", "FXAA", |ui| {
+            if ui.checkbox("fxaa_enabled", "Enabled", &mut post.fxaa.enabled).changed() {
                 keep = true;
             }
         });
 
-        ui.collapsing_header("Fog", |ui| {
-            if ui.checkbox("Enabled", &mut post.fog.enabled).changed() {
+        ui.collapsing_header("fog", "Fog", |ui| {
+            if ui.checkbox("fog_enabled", "Enabled", &mut post.fog.enabled).changed() {
                 keep = true;
             }
             ui.add_enabled(post.fog.enabled, |ui| {

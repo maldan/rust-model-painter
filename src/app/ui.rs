@@ -358,7 +358,7 @@ fn uv_panel(
             a.active = docs[a.paint_map.index()].active;
             a.keep = true;
         }
-        if ui.checkbox("Show UV", &mut uv.show_uv).changed() {
+        if ui.checkbox("show_uv", "Show UV", &mut uv.show_uv).changed() {
             a.keep = true;
         }
     });
@@ -398,7 +398,7 @@ fn brush_panel(
         }
         if a.seg_tool == SegTool::Rect {
             if ui
-                .checkbox("Through mesh", &mut a.rect_through)
+                .checkbox("rect_through", "Through mesh", &mut a.rect_through)
                 .changed()
             {
                 a.keep = true;
@@ -410,7 +410,7 @@ fn brush_panel(
         }
         ui.separator();
         ui.label("Mesh");
-        if ui.button("Open…").clicked() {
+        if ui.button("open_model", "Open…").clicked() {
             a.open_model = true;
         }
         let options: &[&str] = if has_model {
@@ -486,7 +486,7 @@ fn brush_panel(
     ui.slider("opacity", &mut brush.opacity, 0.05..=1.0);
     ui.separator();
     ui.label("Mesh");
-    if ui.button("Open…").clicked() {
+    if ui.button("open_model", "Open…").clicked() {
         a.open_model = true;
     }
     let options: &[&str] = if has_model {
@@ -516,7 +516,7 @@ fn lights_panel(ui: &mut Ui, a: &mut Actions, scene: &mut Scene) {
     if let Some(Light::Directional(d)) = scene.lights.first_mut() {
         ui.separator();
         ui.label("Directional");
-        if ui.checkbox("Cast shadows", &mut d.cast_shadows).changed() {
+        if ui.checkbox("cast_shadows", "Cast shadows", &mut d.cast_shadows).changed() {
             a.keep = true;
         }
         ui.label("Intensity");
@@ -561,7 +561,7 @@ fn layers_panel(ui: &mut Ui, a: &mut Actions, docs: &mut [PaintDocument; 4]) {
         {
             a.add_layer = true;
         }
-        if ui.button("Fill").clicked() {
+        if ui.button("add_fill", "Fill").clicked() {
             a.add_fill = true;
         }
         if ui
@@ -694,7 +694,7 @@ fn segments_panel(ui: &mut Ui, a: &mut Actions, segmentation: &mut Segmentation)
             a.keep = true;
         }
     });
-    if ui.button("Unwrap UV").clicked() {
+    if ui.button("unwrap_uv", "Unwrap UV").clicked() {
         a.unwrap_uv = true;
         a.keep = true;
     }

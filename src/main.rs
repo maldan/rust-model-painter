@@ -145,6 +145,8 @@ struct FrameInput {
     modifiers: winit::keyboard::ModifiersState,
     clipboard_paste: String,
     look_delta: Vec2,
+    last_mouse_pos: Option<Vec2>,
+    mouse_delta: Vec2,
 }
 
 impl FrameInput {
@@ -157,6 +159,7 @@ impl FrameInput {
         self.mouse_middle_released = false;
         self.scroll_delta = Vec2::ZERO;
         self.look_delta = Vec2::ZERO;
+        self.mouse_delta = Vec2::ZERO;
         self.text.clear();
         self.key_backspace = false;
         self.key_delete = false;
@@ -189,6 +192,7 @@ impl FrameInput {
             mouse_middle_released: self.mouse_middle_released,
             viewport,
             scroll_delta: self.scroll_delta,
+            mouse_delta: self.mouse_delta,
             dt,
             text: self.text.clone(),
             key_backspace: self.key_backspace,
@@ -1068,7 +1072,12 @@ impl ApplicationHandler for Host {
             }
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::CursorMoved { position, .. } => {
-                self.input.mouse_pos = Vec2::new(position.x as f32, position.y as f32);
+                let pos = Vec2::new(position.x as f32, position.y as f32);
+                if let Some(prev) = self.input.last_mouse_pos {
+                    self.input.mouse_delta += pos - prev;
+                }
+                self.input.last_mouse_pos = Some(pos);
+                self.input.mouse_pos = pos;
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
